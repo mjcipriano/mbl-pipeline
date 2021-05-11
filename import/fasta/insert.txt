@@ -1,0 +1,8 @@
+	if($insert_database)
+	{
+		$insert_contig->execute($supercontig_id, $length, 1, 1, $length, 0, 0, $contig_id, 1, 1, $length);
+		$insert_contig_seq->execute('contig_' . $contig_id, $sequence);
+		$insert_read->execute($sequence_id);
+		$insert_into_read_assembly->execute($sequence_id, $length, 1, $length, $contig_id, $length, 1, $length, '+');
+		$insert_reads_bases->execute($sequence_id, $sequence);
+	}

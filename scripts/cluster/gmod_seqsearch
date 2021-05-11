@@ -1,0 +1,230 @@
+#!/usr/bin/perl -w
+
+#########################################
+#
+# gmod_seqsearch
+#
+# Authors: Michael Cipriano, Susan Huse
+#
+# Copyright (C) 2005 Marine Biological Laboratory
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# For a copy of the GNU General Public License, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+# or visit http://www.gnu.org/copyleft/gpl.html
+#
+# Keywords : if you want seqinfoname to find this, remove the space before the colon 
+# 
+# Assumptions: 
+#
+# Revisions: Sue Huse, May 15, 2007 -- code updated, commented, fixed
+#
+# Programming Notes:
+#
+########################################
+use strict;
+use Bio::SimpleAlign;
+use Bio::Tools::Run::StandAloneBlast;
+use Bio::Tools::Run::Hmmer;
+use Bio::SearchIO::Writer::HTMLResultWriter;
+use Bio::Tools::BPlite::Sbjct;
+use Bio::AlignIO;
+use Bio::SeqIO;
+use Bio::Root::IO;
+use DBI;
+use Conjbpcdb;
+
+########################################
+#
+# Set global variables
+#
+########################################
+my $organism = $ARGV[0];
+my $hits_to_store = 1000000000000;
+my $writerhtml = new Bio::SearchIO::Writer::HTMLResultWriter();
+
+########################################
+#
+# Set up database connection and queries
+#
+########################################
+my $mbl = Conjbpcdb::new(undef, $organism);
+my $dbh = $mbl->dbh;
+
+# Grab next sequence from sequence_search table
+my $selectSequenceSQL = "SELECT s.id, s.idname, s.sequence_type_id, s.db_id, s.algorithm_id, s.sequence, s.translate, a.name as algorithm_name, db.name as database_name FROM sequence_search s, algorithms a, db WHERE db.id = s.db_id AND a.id = s.algorithm_id LIMIT 1 ";
+my $selectSequence_h = $dbh->prepare($selectSequenceSQL);
+
+# Insert sequence into the current_search table
+my $insertCurrentSQL = "INSERT INTO	current_search (idname, sequence_type_id, db_id, algorithm_id) VALUES (?, ?, ?, ?)";
+my $insertCurrent_h = $dbh->prepare($insertCurrentSQL);
+
+# Delete the sequence from the sequence_search table
+my $deleteSearchSQL = "delete from sequence_search where id = ?";
+my $deleteSearch_h = $dbh->prepare($deleteSearchSQL);
+
+# Delete previous blast_results 
+my $deleteBlastResultsSQL = "DELETE FROM blast_results WHERE idname=? AND sequence_type_id=? AND db=? AND algorithm=?";
+my $deleteBlastResults_h = $dbh->prepare($deleteBlastResultsSQL);
+
+# Delete previous blast_report
+my $deleteBlastReportSQL = "DELETE FROM blast_report_full WHERE idname=? AND sequence_type_id=? AND db_id=? AND algorithm_id=?"; 
+my $deleteBlastReport_h = $dbh->prepare($deleteBlastReportSQL);
+
+# Insert new blast_results
+my $insertBlastResultsSQL = "INSERT INTO blast_results ( idname, sequence_type_id, score, evalue, query_start, query_end, hit_name, hit_start, hit_end, hit_rank, accession_number, description, algorithm, db, gaps, frac_identical, frac_conserved, query_string, hit_string, homology_string, hsp_rank, hsp_strand, gi) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+my $insertBlastResults_h = $dbh->prepare($insertBlastResultsSQL);
+
+# Insert new blast_report
+my $insertBlastReportSQL = "insert into blast_report_full (idname, sequence_type_id, db_id, algorithm_id, report) VALUES (?, ?, ?, ?, ?)";
+my $insertBlastReport_h = $dbh->prepare($insertBlastReportSQL);
+
+# Delete from current_search
+my $deleteCurrentSQL = "delete from current_search where idname = ? AND sequence_type_id = ? AND db_id = ? AND algorithm_id = ?";
+my $deleteCurrent_h = $dbh->prepare($deleteCurrentSQL);
+
+########################################
+#
+# Step through the sequences, blast, and insert results
+#
+########################################
+my $userName = `whoami`;
+chomp($userName);
+
+my $last_id = '';
+
+while(1)
+{
+	# Check to see if the user has set a stop 
+	if(check_continue($organism)) { exit; }
+
+	$selectSequence_h->execute;
+
+	# If no more sequences, then exit
+	if($selectSequence_h->rows == 0) {exit;} 
+
+	# Move the sequence to current_search
+    my $this_row = $selectSequence_h->fetchrow_hashref;
+	$insertCurrent_h->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id}); 
+
+	if($insertCurrent_h->rows == 1)
+	{
+		# Delete from sequence_search, and previous blast results
+        $deleteSearch_h->execute($this_row->{id});
+        $deleteBlastResults_h->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id}); 
+        $deleteBlastReport_h->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id});
+
+		# Get ready to blast
+		my $blast_report;
+		my $factory;
+		my $input = Bio::Seq->new(-id=>$this_row->{idname} , '-seq' => $this_row->{sequence} );
+
+		# Translate to protein if necessary
+		if($this_row->{translate} eq 'Y') { $input = $input->translate(); }
+
+		# Use Hmmer
+		if($this_row->{algorithm_name} eq 'hmmpfam')
+		{
+			$factory = Bio::Tools::Run::Hmmer->new('program'=>'hmmpfam', 'db'=>'/blastdb/' . $this_row->{database_name});
+			$blast_report = $factory->run($input);
+
+		# Use iprscan
+		} elsif($this_row->{algorithm_name} eq 'iprscan') {
+			#Not yet available
+
+		# Use Blast 
+		} else {
+			my @params = ('program' => $this_row->{algorithm_name}, 'database' => '/blastdb/' . $this_row->{database_name}, 'I'=> 'T');
+			$factory = Bio::Tools::Run::StandAloneBlast->new(@params);
+	    	$blast_report = $factory->blastall($input);
+		}
+
+	 	my $this_result = $blast_report->next_result;
+		my $current_hit = 0;
+
+		# Step through all results and process
+		while( (my $hit = $this_result->next_hit()) && ($current_hit < $hits_to_store) )
+		{
+			$current_hit++;
+			while(my $hsp = $hit->next_hsp)
+			{
+				# Clean gi and accession numbers
+				my $gi_num = undef;
+				my $acc_num = $hit->accession;
+				if($hit->name =~ /gi|/)
+				{
+					($gi_num) = $hit->name =~ /gi\|(\d+)/;
+				}
+
+				if($hit->accession =~ /^gi|/)
+				{
+					$acc_num =~ s/gi\|//;
+				}
+
+				# Insert the blast results
+	  			$insertBlastResults_h->execute(
+					$this_row->{idname},
+					$this_row->{sequence_type_id},
+					$hsp->score,
+					$hsp->evalue,
+					$hsp->query->start,
+					$hsp->query->end,
+					$hit->name,
+					$hsp->hit->start,
+					$hsp->hit->end,
+					$hit->rank,
+					$acc_num,
+					$hit->description,
+					$this_row->{algorithm_id},
+					$this_row->{db_id},
+					$hsp->gaps,
+					$hsp->frac_identical,
+					$hsp->frac_conserved,
+					$hsp->query_string,
+					$hsp->hit_string,
+					$hsp->homology_string,
+					$hsp->rank,
+					$hsp->strand,
+					$gi_num
+					);
+			} # END HSP
+		} # END CURRENT HIT WHILE
+	
+		# Insert the blast report 
+		$insertBlastReport_h->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id}, $writerhtml->to_string($this_result));
+
+		# Delete sequence from current_search
+   	 	$deleteCurrent_h->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id});
+
+	} # END SOMEONE ALREADY WORKING ON IT (current_search insert)
+		#sleep int(rand(11));
+
+}  # END WHILE KEEP GOING
+
+
+########################################
+#
+# Subroutine: check_continue
+#
+########################################
+sub check_continue
+{
+	my $organism = shift;
+
+	if(-f "/xraid/habitat/$userName/$organism.stop")
+	{
+		print "Exiting due to user request (stop file existence)\n";
+		return 1;
+	}
+
+	return 0;
+}

@@ -1,0 +1,4 @@
+These files are simply sql statements useful when administering the databases.
+They are not part of the gmod website, nor are they used by any automated scripts.
+They are used by an administrator on the mysql commandline:  source <filename>
+and are edited as necessary.

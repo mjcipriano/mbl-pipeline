@@ -1,0 +1,5309 @@
+#!/usr/bin/perl
+
+###############################################################################
+#  mblpipe
+#  takes in assembly files and outputs to mysql and gff for use with GBrowse
+#
+#  Usage:  mblpipe --sysfile=<sysconfig> --runfile=<runfile> --configuration=<conf file> --dbfile=<db file> 
+#
+#  Options:
+#           --cleanup - give a value of 0 or 1. If 1, this will remove the configuration and runfile after it is read in. This is used for mostly web based running of this script.
+#  Notes:  Mbl.pm must be included in the same directory as this script and be
+#          set up to access the database
+#
+
+use Bio::SeqIO;
+use Bio::Seq;
+use Getopt::Long;
+use DBI;
+use XML::DOM;
+use Bio::Tools::Run::Alignment::Clustalw;
+use Bio::AlignIO;
+use IO::String;
+#use Net::SSH::Perl;
+use CGI qw(:all);
+use Bio::Tools::Run::StandAloneBlast;
+use File::Temp qw/ tempfile tempdir /;
+use Mbl;
+
+use strict;
+
+my $executable_location = $0;
+$executable_location =~ s/\/mblpipe$//;
+$executable_location .= '/';
+
+# Get the command line options
+my %organism_config;
+my $organism_config_file = undef;
+my %sys_config;
+my $sys_config_file = undef;
+my %run_options;
+my $run_options_file = undef;
+my $db_config_file = undef;
+my %db_config;
+my $cleanup = 0;
+my $arguments = GetOptions("sysfile=s"	=>\$sys_config_file,
+				"configuration=s"	=>\$organism_config_file,
+				"runfile=s"	=>\$run_options_file,
+				"dbfile=s" =>\$db_config_file,
+				"cleanup=i"	=>\$cleanup
+			);
+			
+if( !defined($sys_config_file) && defined($ENV{MBLPIPE_SYSFILE}) )
+{
+	debug("Using default sys configuration file", 0);
+	$sys_config_file = $ENV{MBLPIPE_SYSFILE};
+} elsif( !defined($sys_config_file) && !defined($ENV{MBLPIPE_SYSFILE}) )
+{
+	$sys_config_file = $executable_location . '/conf/mblpipe.conf';
+	$ENV{MBLPIPE_SYSFILE} = $sys_config_file;
+} elsif( defined($sys_config_file) )
+{
+	$ENV{MBLPIPE_SYSFILE} = $sys_config_file;
+}
+
+# Process System Options
+debug("Processing system options file:\t$sys_config_file", 0);
+process_options_file($sys_config_file, \%sys_config);
+
+# Process Organism Options
+debug("Processing Organism Options:\t$organism_config_file", 0);
+process_options_file($organism_config_file, \%organism_config);
+
+
+# Process Run Options
+debug("Processing run file:\t$run_options_file", 0);
+my $db_options_set = 0;
+process_options_file($run_options_file, \%run_options);
+
+if($cleanup)
+{
+	system("rm -f $run_options_file");
+	system("rm -f $organism_config_file");
+}
+if(!defined($db_config_file) && defined($ENV{MBLPIPE_DB_FILE}) )
+{
+	debug("Using default db configuration file", 0);
+	$db_config_file = $ENV{MBLPIPE_DBFILE};
+} elsif( !defined($db_config_file) && !defined($ENV{MBLPIPE_DB_FILE}) )
+{
+	$db_config_file = $executable_location . 'conf/db.conf';
+	$ENV{MBLPIPE_DBFILE} = $db_config_file;
+} elsif( defined($db_config_file) )
+{
+	 $ENV{MBLPIPE_DBFILE} = $db_config_file;
+} else
+{
+	# Get the information from the Mbl.pm file
+	$db_options_set = 1;
+	my $mbl_temp = Mbl::new(undef, undef);
+	$db_config{'driver'} = $mbl_temp->{DRIVER};
+	$db_config{'hostname'} = $mbl_temp->{HOSTNAME};
+	$db_config{'port'} = $mbl_temp->{PORT};
+	$db_config{'user'} = $mbl_temp->{USER};
+	$db_config{'password'} = $mbl_temp->{PASSWORD};
+}
+
+# Process DB Options
+debug("Processing DB Options:\t$db_config_file", 0);
+if(!$db_options_set)
+{
+	process_options_file($db_config_file, \%db_config);
+}
+
+# Process command line options
+
+my $organism = $organism_config{'organism'} if defined($organism_config{'organism'});
+my $organism_name = $organism_config{'organism_name'};
+my $release_date = $organism_config{'release_date'};
+my $release_version = $organism_config{'release_version'};
+my $old_orf_database = $organism_config{'old_orf_database'};
+my $sage_dir = $organism_config{'sage_dir'} . '/';
+my $sage_file = $organism_config{'sage_file'};
+my $tagsize = $organism_config{'tagsize'};
+
+
+# Option settings for analyses
+my $minimum_gap_fg = $organism_config{'minimum_gap_fg'} if defined($organism_config{'minimum_gap_fg'});
+my $minimum_gap_length = $organism_config{'minimum_gap_length'} if defined($organism_config{'minimum_gap_length'});
+my $minimum_orf_length = $organism_config{'minimum_orf_length'} if defined($organism_config{'minimum_orf_length'});
+my $maximum_orf_length = $organism_config{'maximum_orf_length'} if defined($organism_config{'maximum_orf_length'});
+my $remove_orf_false_start = $organism_config{'remove_orf_false_start'} if defined($organism_config{'remove_orf_false_start'});
+my $remove_orf_no_stop = $organism_config{'remove_orf_no_stop'} if defined($organism_config{'remove_orf_no_stop'});
+my $ref_percent = $organism_config{'ref_percent'} if defined($organism_config{'ref_percent'});
+my $unique_bases = $organism_config{'unique_bases'} if defined($organism_config{'unique_bases'});
+my $min_frac_identical = $organism_config{'min_frac_identical'} if defined($organism_config{'min_frac_identical'});
+my $is_bacterial = $organism_config{'is_bacterial'} if defined($organism_config{'is_bacterial'});
+my $transcript_tail = $organism_config{'transcript_tail'} if defined($organism_config{'transcript_tail'});
+
+
+
+#################################
+#
+# Program executable locations and file names
+#
+#################################
+
+#Mysql settings
+my $driver = $db_config{'driver'} if defined($db_config{'driver'});
+my $hostname = $db_config{'hostname'} if defined($db_config{'hostname'});
+my $port = $db_config{'port'} if defined($db_config{'port'});
+my $user = $db_config{'user'} if defined($db_config{'user'});
+my $password = $db_config{'password'} if defined($db_config{'password'});
+#Load data local infile which is invoked by bp_bulk_load_gff.pl does not work over the private network with jumbo frames. 
+#For this call we are using the public network address.
+#my $publicNetworkHostname = "128.128.174.75";
+#my $publicNetworkHostname = "10.0.0.75";
+
+
+# Directores for source data
+my $base_dir = $organism_config{'base_dir'} if defined($organism_config{'base_dir'});
+my $working_dir = $organism_config{'working_dir'};
+my $run_dir = $organism_config{'run_dir'} if defined($organism_config{'run_dir'});
+my $root_web_dir = $sys_config{'root_web_dir'} if defined($sys_config{'root_web_dir'});
+my $web_php_dir = $sys_config{'web_php_dir'} if defined($sys_config{'web_php_dir'});
+my $gbrowse_conf_dir = $sys_config{'gbrowse_conf_dir'} if defined($sys_config{'gbrowse_conf_dir'});
+my $data_output_dir = "./";
+if(defined($sys_config{'data_load_dir'}))
+{
+	$data_output_dir =  $sys_config{'data_load_dir'} 
+}
+
+# Location of executables
+my $database_bulk_loader = $sys_config{'database_bulk_loader'} if defined($sys_config{'database_bulk_loader'});
+#warn "Database bulk loader: $database_bulk_loader\n";
+my $database_incremental_loader = $sys_config{'database_incremental_loader'} if defined($sys_config{'database_incremental_loader'});
+my $blast_bin_dir = $sys_config{'blast_bin_dir'} if defined($sys_config{'blast_bin_dir'});
+my $blast_db_dir = $sys_config{'blast_db_dir'} if defined($sys_config{'blast_db_dir'});
+my $emboss_db_dir = $sys_config{'emboss_db_dir'} if defined($sys_config{'emboss_db_dir'});
+my $repeatFinder_bin = $sys_config{'repeatFinder_bin'} if defined($sys_config{'repeatFinder_bin'});
+my $trnascan_bin = $sys_config{'trnascan_bin'} if defined($sys_config{'trnascan_bin'});
+my $testcode_unix_bin = $sys_config{'testcode_unix_bin'} if defined($sys_config{'testcode_unix_bin'});
+
+my $temp_dir = $sys_config{'temp_dir'} if defined($sys_config{'temp_dir'});
+
+my $glimmer_bin_dir = $sys_config{'glimmer_bin_dir'} if defined($sys_config{'glimmer_bin_dir'});
+my $build_icm_bin = $sys_config{'build_icm_bin'} if defined($sys_config{'build_icm_bin'});
+my $glimmer_bin = $sys_config{'glimmer_bin'} if defined($sys_config{'glimmer_bin'});
+my $glimmer_options = $sys_config{'glimmer_options'} if defined($sys_config{'glimmer_options'});
+
+my $emboss_dir = $sys_config{'emboss_dir'} if defined($sys_config{'emboss_dir'});
+my $cai_bin = $sys_config{'cai_bin'} if defined($sys_config{'cai_bin'});
+my $cusp_bin = $sys_config{'cusp_bin'} if defined($sys_config{'cusp_bin'});
+my $chips_bin = $sys_config{'chips_bin'} if defined($sys_config{'chips_bin'});
+my $mummer_bin = $sys_config{'mummer_bin'} if defined($sys_config{'mummer_bin'});
+my $promer_bin = $sys_config{'promer_bin'} if defined($sys_config{'promer_bin'});
+my $nucmer_bin = $sys_config{'nucmer_bin'} if defined($sys_config{'nucmer_bin'});
+my $mummer_options = $sys_config{'mummer_options'} if defined($sys_config{'mummer_options'});
+
+#################################
+#
+# Use the Mbl.pm file
+#
+#################################
+
+param(-name=>'organism', -value=>$organism);
+
+#################################
+#
+# Set the remaining parameters based on the conf files
+#
+#################################
+# Database settings
+my $database = $organism;
+my $dsn = "DBI:$driver:database=$database;host=$hostname;port=$port";
+my $db_database_name = $organism . "db";
+my $db_supercontig_database_name = $organism . "sc";
+my $db_supercontig_read_database_name = $organism . "screads";
+
+
+# Directory structure settings
+my $web_dir = $root_web_dir . '/' . $organism . '/';
+my $download_dir = $web_dir . 'download/';
+my $root_dir = $base_dir . '/' . $working_dir;
+my $ace_dir = $root_dir . '/' . $run_dir . '/' . 'acefiles';
+my $load_dir = $data_output_dir  . "/$organism/gff/";
+
+# Remaining executables and options
+my $build_icm_bin = $glimmer_bin_dir . "build-icm";
+my $glimmer_bin = $glimmer_bin_dir . "glimmer3";
+my $glimmer_options = '-o 0 -p 0';
+my $cai_bin = $emboss_dir . "cai";
+my $cusp_bin = $emboss_dir . "cusp";
+my $chips_bin = $emboss_dir . "chips";
+
+# File names and locations
+my $xml_file = $root_dir . "/traceinfo/reads.xml";
+my $assembly_unplaced_file = $root_dir . '/' . $run_dir . '/' . 'assembly.unplaced';
+my $assembly_links_file = $root_dir . '/' . $run_dir . '/' . 'assembly.links';
+my $assembly_reads_file = $root_dir . '/' . $run_dir . '/' . 'assembly.reads';
+my $fasta_bases_file = $root_dir . '/' . $run_dir . '/' . 'assembly.bases';
+my $fasta_qual_bases_file = $root_dir . '/' . $run_dir . '/' . 'assembly.qual';
+my $fasta_reads_bases_file =  $root_dir . '/' . 'reads.fasta';
+my $fasta_reads_quality_file =  $root_dir . '/' . 'reads.qual';
+
+my $gff_contig_dir = $load_dir . "contig/";
+my $gff_supercontig_dir = $load_dir . "supercontig/";
+my $gff_output_file = $gff_contig_dir . "contig.gff";
+my $gff_supercontig_read_output_file = $gff_supercontig_dir . "supercontig_read.gff";
+my $gff_supercontig_orf_output_file = $gff_supercontig_dir . "orf_supercontig.gff";
+my $gff_orf_output_file = $gff_contig_dir . "orf.gff";
+my $gff_supercontig_sage_output_file =  $gff_supercontig_dir . "supercontig_sage.gff";
+my $gff_sage_output_file =  $gff_contig_dir . "sage.gff";
+my $gff_repeat_file = $gff_contig_dir . "repeat.gff";
+my $gff_supercontig_repeat_file = $gff_supercontig_dir . "supercontig_repeat.gff";
+my $gff_cdna_file = $gff_supercontig_dir . "cDNA.gff";
+my $fasta_cdna_file = $load_dir .  "/cDNA.fasta";
+my $gff_trna_file = $gff_contig_dir . "trna.gff";
+my $gff_supercontig_trna_file = $gff_supercontig_dir . "supercontig_trna.gff";
+my $gff_supercontig_domains_file = $gff_supercontig_dir . "supercontig_domains.gff";
+
+my $gff_retrotransposon_file = $gff_supercontig_dir . "retrotransposon.gff";
+my $gff_snrna_file = $gff_supercontig_dir . "snRNA.gff";
+my $gff_snorna_file =  $gff_supercontig_dir . "snoRNA.gff";
+my $gff_hyb_file   = $gff_supercontig_dir . "hybridizations.gff";
+my $gff_sts_file   = $gff_supercontig_dir . "STS.gff";
+my $gff_antisense_file = $gff_supercontig_dir . "antisense.gff";
+my $gff_telomericrepeat_file = $gff_supercontig_dir . "telomere_repeat.gff";
+my $gff_rdna_file = $gff_supercontig_dir . "rDNA.gff";
+my $gff_transcription_file =  $gff_supercontig_dir . "transcription.gff";
+my $gff_rfam_file = $gff_supercontig_dir . "rfam.gff";
+my $gff_primers_file = $gff_supercontig_dir . "primers.gff";
+
+my $gff_transcript_file = $gff_supercontig_dir . "transcript.gff";
+my $gff_intergenic_file = $gff_contig_dir . "intergenic.gff";
+my $gff_supercontig_intergenic_file = $gff_supercontig_dir . "supercontig_intergenic.gff";
+my $gff_coverage_file = $gff_contig_dir . "coverage.gff";
+my $gff_supercontig_coverage_file = $gff_supercontig_dir . "supercontig_coverage.gff";
+my $gff_quality_file = $gff_contig_dir . "quality.gff";
+my $gff_supercontig_quality_file = $gff_supercontig_dir . "supercontig_quality.gff";
+my $gff_compare_file = $gff_contig_dir . "compare.gff";
+my $gff_supercontig_compare_file  = $gff_supercontig_dir . "supercontig_compare.gff";
+my $gff_supercontig_uniqueness = $gff_supercontig_dir . "supercontig_uniqueness.gff";
+my $gff_uniqueness = $gff_contig_dir . "uniqueness.gff";
+my $gff_matches = $gff_contig_dir . "matches.gff";
+my $gff_supercontig_matches = $gff_supercontig_dir . "supercontig_matches.gff";
+my $gff_supercontig_hand = $gff_supercontig_dir . "supercontig_hand.gff"; #added by Sue Huse to load other data created by hand.
+
+my $modified_reads_fasta_file = $load_dir . "/trimmed_reads.fasta";
+my $supercontig_fasta_file = $gff_supercontig_dir . "/supercontig.fasta";
+my $cds_fasta_file = $gff_supercontig_dir . "/cds.fasta";  #Sue Huse added for loading CDS dna
+my $slices_fasta_file = $gff_supercontig_dir. "/slices.fasta"; #Sue Huse added for loading slices
+
+my $orf_input_file = "gff/" . $organism . "_orfs.gff"; 
+
+my $fasta_train_file = "tables/$organism" . ".fasta";
+if(defined($organism_config{'orf_training_set'}))
+{
+	$fasta_train_file = $organism_config{'orf_training_set'};
+}
+my $cusp_codon_file = "tables/$organism/cusp_out.cod";
+
+my $debug = 1;
+
+debug("Finished reading the configuration and parameter information.\n", 0);
+
+#################################
+#
+# Determine database type 
+#	project_type from gmoddb.gmodweb_databases
+#
+#################################
+my $mbl = Mbl::new(undef, 'gmoddb');
+my $dbh = $mbl->dbh;
+my $sth = $dbh->prepare("SELECT project_type from gmodweb_databases WHERE database_name=?");
+$sth->execute($organism);
+#my $project_type = $sth->fetchrow_hashref;
+my $project_type = "genome";
+if($sth->rows > 0)
+{
+	my $row = $sth->fetchrow_hashref;
+	$project_type = $row->{project_type};	
+}
+$sth->finish;
+#warn "Project type is: $project_type\n";
+
+$mbl = undef;
+$dbh = undef;
+
+#################################
+#
+# Drop Schema
+#	drop the entire database and starts over from scratch
+#
+#################################
+if($run_options{'drop_schema'})
+{
+	#print "Start: Dropping Schema\n";
+
+        system("echo \"drop database $organism\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"drop database $db_supercontig_read_database_name\" | mysql -u $user -h $hostname --password=$password");
+	#print "End: Dropping Schema\n";
+}
+
+#################################
+#
+# Create Schema
+# 	Create a new database from scratch, and grant the appropriate privileges
+#
+#################################
+if($run_options{'create_schema'})
+{
+	#print "Start: Creating Schema\n";
+	system("echo \"create database IF NOT EXISTS $organism\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"create database IF NOT EXISTS $db_supercontig_read_database_name\" | mysql -u $user -h $hostname --password=$password");
+
+
+	system("mysql -u $user -h $hostname --password=$password -D $organism < $executable_location/sql/create_script.sql");
+
+	system("echo \"grant select on $db_supercontig_read_database_name.* to nobody\@'%'\" | mysql -u $user -h $hostname  --password=$password");
+        system("echo \"grant select on $db_supercontig_read_database_name.* to gbrowse\@'%' identified by 'ropassword123'\" | mysql -u $user -h $hostname --password=$password");
+
+
+	system("echo \"grant all privileges on $organism.* to $user\@'%' identified by '$password'\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"grant all privileges on $db_supercontig_read_database_name.* to $user\@'%' identified by '$password'\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"flush privileges\" | mysql -u $user -h $hostname --password=$password");
+	#print "End: Creating Schema\n";
+}
+
+if($run_options{'create_gbrowse_database'})
+{
+	system("echo \"create database IF NOT EXISTS $db_supercontig_read_database_name\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"grant select on $db_supercontig_read_database_name.* to nobody\@'%'\" | mysql -u $user -h $hostname  --password=$password");
+	system("echo \"grant select on $db_supercontig_read_database_name.* to gbrowse\@'%' identified by 'ropassword123'\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"grant all privileges on $db_supercontig_read_database_name.* to $user\@'%' identified by '$password'\" | mysql -u $user -h $hostname --password=$password");
+	system("echo \"flush privileges\" | mysql -u $user -h $hostname --password=$password");
+
+
+}
+
+
+#################################
+#
+# Connect to the database we just created
+#
+#################################
+my $mbl = Mbl::new(undef, $organism, \%db_config);
+my $dbh = $mbl->dbh;
+
+my $drh = DBI->install_driver("mysql");
+
+
+
+
+#################################
+#
+# Create the necessary load/ and table/ directories
+#
+#  intermediate files that can be created, anywhere
+#################################
+if($run_options{'create_directories'})
+{
+	#print "Start: Creating Directories\n";
+	if (! -d "$data_output_dir") { system("mkdir $data_output_dir"); }
+	if (! -d "$data_output_dir/$organism") {system("mkdir $data_output_dir/$organism");}
+	if (! -d "$data_output_dir/$organism/gff") {system("mkdir $data_output_dir/$organism/gff");}
+	if (! -d "$data_output_dir/$organism/gff/contig") {system("mkdir $data_output_dir/$organism/gff/contig");}
+	if (! -d "$data_output_dir/$organism/gff/supercontig") {system("mkdir $data_output_dir/$organism/gff/supercontig");}
+	if (! -d "$data_output_dir/$organism/tables") {system("mkdir $data_output_dir/$organism/tables");}
+	#print "End: Creating Directories\n";
+
+}
+
+#################################
+#
+# Parse XML (file: reads.xml)
+#
+#################################
+if($run_options{'parse_xml'})
+{
+	#print "Start: Parse $xml_file file\n";
+
+	$dbh->do("delete from reads");
+
+	# instantiate parser
+	my $xp = new XML::DOM::Parser();
+
+	# parse and create tree
+	my $doc = $xp->parsefile($xml_file) or die ("Can not open $xml_file file!");
+
+	# get root node (trace_volume)
+	my $root = $doc->getDocumentElement();
+
+	# get children (trace)
+	my @my_reads = $root->getChildNodes();
+
+		        my $xmlread_h = $dbh->prepare('insert into reads (
+	                    read_name,
+	                    center_name,
+	                    plate_id,
+	                    well_id,
+	                    template_id,
+	                    library_id,
+	                    trace_end,
+	                    trace_direction
+	                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'); 
+	# iterate through trace_volume list
+	foreach my $node (@my_reads)
+	{
+		# if element node
+		if ($node->getNodeType() == 1)
+		{
+	                my $trace_name = '';
+	                my $center_name = '';
+	                my $plate_id = '';
+	                my $well_id = '';
+	                my $template_id = '';
+	                my $library_id = '';
+	                my $trace_end = '';
+	                my $trace_direction = '';
+
+			my @children = $node->getChildNodes();
+
+			# iterate through child nodes
+			foreach my $item (@children)
+			{
+				# check element name
+				if (lc($item->getNodeName) eq "trace_name")
+				{
+					$trace_name = $item->getFirstChild()->getData;
+				}elsif (lc($item->getNodeName) eq "center_name")
+				{
+					$center_name =  $item->getFirstChild()->getData;
+				}elsif (lc($item->getNodeName) eq "plate_id")
+				{
+					$plate_id = $item->getFirstChild()->getData;
+				}elsif (lc($item->getNodeName) eq "well_id")
+				{
+	                                $well_id = $item->getFirstChild()->getData;
+				}elsif (lc($item->getNodeName) eq "template_id")
+	                        {
+					if($item->getFirstChild())
+					{
+	                                	$template_id = $item->getFirstChild()->getData;
+					}
+	                        }elsif (lc($item->getNodeName) eq "library_id")
+	                        {
+					if($item->getFirstChild())
+					{
+	                                	$library_id = $item->getFirstChild()->getData;
+					}
+	                        }elsif (lc($item->getNodeName) eq "trace_end")
+	                        {
+	                                $trace_end = $item->getFirstChild()->getData;
+	                        }elsif (lc($item->getNodeName) eq "trace_direction")
+	                        {
+	                                $trace_direction = $item->getFirstChild()->getData;
+	                        }
+
+			}
+			$xmlread_h->execute($trace_name, $center_name, $plate_id, $well_id, $template_id, $library_id, $trace_end, $trace_direction);
+		}
+	}
+        #print "End: Parse $xml_file file\n";
+
+}
+#######DONE WITH READS.XML FILE###############
+
+
+#################################
+#
+# Parse unplaced (file: assembly.unplaced)
+#
+#################################
+if($run_options{'parse_unplaced'})
+{
+	#print "Start: Parse $assembly_unplaced_file file\n";
+
+	open(ASSM, "$assembly_unplaced_file") or warn ("Can not open $assembly_unplaced_file");
+	my $update_status_query = "UPDATE reads SET status = ? WHERE read_name = ?";
+        my $sth = $dbh->prepare($update_status_query);
+
+	while (<ASSM>)
+	{
+	    my $line = $_;
+	    my @this_line = split(" ", $line);
+
+	    $sth->execute($this_line[1], $this_line[0]);
+	    $sth->finish;
+
+	}
+	close(ASSM);
+        #print "End: Parse $assembly_unplaced_file file\n";
+}
+#######DONE ASSEMBLY.UNPLACED FILE#############
+
+#################################
+#
+# Parse Assembly Links (file: assembly.links)
+#
+#################################
+if($run_options{'parse_links'})
+{
+	#print "Start: Parse $assembly_links_file file\n";
+	open(LINKS, "$assembly_links_file") or die ("Can not open $assembly_links_file");
+	$dbh->do("delete from links");
+
+	#super_id
+	#num_bases_in_super
+	#num_contigs_in_super
+	#ordinal_num_of_contig_in_supercontig_id
+	#contig_number
+	#length_of_contig
+	#estimated_gap_before_contig
+	#estimated_gap_after_contig
+        my $update_links_query = "insert into links
+                                (super_id, bases_in_super, contigs_in_super, ordinal_number,
+                                contig_number, contig_length, gap_before_contig, gap_after_contig)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        my $sth = $dbh->prepare($update_links_query);
+
+	while (<LINKS>)
+	{
+	    my $line = $_;
+	    my @this_line = split(" ", $line);
+
+	    if($this_line[0] ne '#super_id')
+	    {
+		    $sth->execute($this_line[0], $this_line[1], $this_line[2], $this_line[3], $this_line[4], $this_line[5], $this_line[6], $this_line[7]);
+	    }
+
+	}
+
+	$sth->finish;
+	close(LINKS);
+	#print "Completed parsing $assembly_links_file file\n";
+
+	# Now determine where contigs are within the supercontig with or without minimum gap length
+
+        my $query = '
+                select distinct
+                super_id
+                FROM
+                links';
+        my $links_result = $dbh->prepare($query);
+        $links_result->execute;
+
+        my $contq = "select contig_number, contig_length, ordinal_number, gap_before_contig from links where super_id = ? ORDER BY ordinal_number";
+        my $conth = $dbh->prepare($contq);
+
+        my $updq = "update links set
+                    modified_contig_start_base = ?
+                    where contig_number = ?";
+	my $updh = $dbh->prepare($updq);
+
+        my $updqbases = "update links set
+                    modified_bases_in_super = ?
+                    where super_id = ?";
+	my $updbases = $dbh->prepare($updqbases);
+
+
+        while(my $links_array = $links_result->fetchrow_hashref)
+        {
+
+                # We need to find out the total modified supercontig length And update where the contig starts in the supercontig
+                my $start_super_base = 1;
+                my $running_end = 0;
+
+                $conth->execute($links_array->{super_id});
+                while(my $this_contig = $conth->fetchrow_hashref)
+                {
+                        my $this_start = 0;
+                        if($this_contig->{gap_before_contig} < 0)
+                        {
+                                $this_start = $running_end + $minimum_gap_length;
+                        } else
+                        {
+                                $this_start = $running_end + $this_contig->{gap_before_contig};
+                        }
+
+                        $updh->execute($this_start, $this_contig->{contig_number});
+
+                        $running_end = $this_start + $this_contig->{contig_length};
+                }
+
+                        $updbases->execute($running_end, $links_array->{super_id});
+        }
+
+
+	# Now without minimum gap length
+	my $query = '
+	        select contig_number,
+	        super_id,
+	        bases_in_super,
+	        contigs_in_super,
+	        ordinal_number,
+	        contig_length,
+	        gap_before_contig,
+	        gap_after_contig,
+	        contig_start_super_base,
+	        modified_contig_start_base,
+	        modified_bases_in_super
+	        FROM
+	        links ORDER BY super_id, ordinal_number';
+	my $links_result = $dbh->prepare($query);
+	$links_result->execute;
+
+	my $last_super_id = '';
+	my $super_running_total = 0;
+
+
+
+	while(my $links_array = $links_result->fetchrow_hashref)
+	{
+
+		if($links_array->{super_id} != $last_super_id)
+		{
+			$super_running_total = 0;
+		}
+
+		my $start_val = $super_running_total + $links_array->{gap_before_contig};
+		my $end_val = $start_val + $links_array->{contig_length};
+		$super_running_total = $end_val;
+		$last_super_id = $links_array->{super_id};
+
+		my $update_base_query = "UPDATE links set contig_start_super_base = '" . $start_val . "'
+	                    WHERE contig_number = '" . $links_array->{contig_number} ."'";
+		my $update_base_result = $dbh->prepare($update_base_query);
+		$update_base_result->execute;
+	}
+        #print "End: Parse assembly.links file\n";
+
+}
+
+#######END ASSEMBLY.LINKS FILE#############
+
+
+#################################
+#
+# Parse Assembly Reads (file: assembly.reads)
+#
+#################################
+if($run_options{'parse_reads'})
+{
+	#print "Start: Parse $assembly_reads_file file\n";
+	open(READS, "$assembly_reads_file") or die ("Can not open $assembly_reads_file");
+	$dbh->do("delete from reads_assembly");
+
+	#read_name
+	#read_status
+	#read_len_untrim
+	#first_base_of_trim
+	#read_len_trim
+	#contig_number
+	#contig_length
+	#trim_read_in_contig_start
+	#trim_read_in_contig_stop
+	#orientation
+	#read_pair_name
+	#read_pair_status
+	#read_pair_contig_number
+	#observed_insert_size
+	#given_insert_size
+	#given_insert_std_dev
+	#observed_inserted_deviation
+
+	my $update_reads_query = "insert into reads_assembly
+                                        (read_name,
+                                        read_status,
+                                        read_len_untrim,
+                                        first_base_of_trim,
+                                        read_len_trim,
+                                        contig_number,
+                                        contig_length,
+                                        trim_read_in_contig_start,
+                                        trim_read_in_contig_stop,
+                                        orientation,
+                                        read_pair_name,
+                                        read_pair_status,
+                                        read_pair_contig_number,
+                                        observed_insert_size,
+                                        given_insert_size,
+                                        given_insert_std_dev,
+                                        observed_inserted_deviation)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+	my $check_read_existence_h = $dbh->prepare("select read_id, read_name from reads where read_name = ?");
+	my $insert_into_reads_h = $dbh->prepare("insert into reads (read_id, read_name) values (NULL, ?)");
+
+	my $sth = $dbh->prepare($update_reads_query);
+
+	
+	while (<READS>)
+	{
+	    my $line = $_;
+            chomp($line);
+            $line =~ s/[\r\n]+$//;
+
+            my @this_line = split("\t", $line);
+            while(scalar @this_line < 17)
+            {
+                push @this_line, '';
+            }
+
+            foreach my $this_var (@this_line)
+	    {
+		if($this_var eq "")
+		{
+		  $this_var = undef;
+		}
+
+	    }
+
+		$check_read_existence_h->execute($this_line[0]);
+		if($check_read_existence_h->rows == 0)
+		{
+			$insert_into_reads_h->execute($this_line[0]);
+		}
+	
+	    $sth->execute( $this_line[0],$this_line[1],$this_line[2],$this_line[3],$this_line[4],$this_line[5],$this_line[6],$this_line[7],$this_line[8],$this_line[9],$this_line[10],$this_line[11],
+				$this_line[12],$this_line[13],$this_line[14],$this_line[15],$this_line[16]);
+
+	}
+
+	$sth->finish;
+	close(READS);
+        #print "End: Parse $assembly_reads_file file\n";
+
+}
+
+#######END ASSEMBLY.READS FILE#############
+
+
+#################################
+#
+# Parse reads bases (file: reads.bases)
+#
+#################################
+if($run_options{'parse_reads_bases'})
+{
+
+        #print "Start: Parse $fasta_reads_bases_file file\n";
+
+	my $in  = Bio::SeqIO->new('-file' => "$fasta_reads_bases_file",
+                         '-format' => 'Fasta');
+
+	$dbh->do("delete from reads_bases");
+	my $insert_query = "insert into reads_bases (read_name, bases) VALUES (?, ?)";
+        my $sth = $dbh->prepare($insert_query);
+
+	while ( my $seq = $in->next_seq() )
+	{
+		# TODO: Add test for empty sequence - got a sequence with no lettersin it, cannot guess alphabet
+		$sth->execute($seq->id, $seq->seq);
+	}
+	$sth->finish;
+        #print "End: Parse $fasta_reads_bases_file file\n";
+
+}
+
+#################################
+#
+# Parse reads quality (file: reads.qual)
+#
+#################################
+if($run_options{'parse_reads_qual'})
+{
+	#print "Start: Parse $fasta_reads_quality_file file\n";
+
+	my $in  = Bio::SeqIO->new('-file' => "$fasta_reads_quality_file",
+                         '-format' => 'qual');
+
+	$dbh->do("delete from reads_quality");
+        my $sth = $dbh->prepare("insert into reads_quality (read_name, quality) VALUES (?, ?)");
+
+	while ( my $seq = $in->next_seq() )
+	{
+		my @quals = @{$seq->qual()};
+		my $qual_string = "";
+		foreach my $q (@quals)
+		{
+			$qual_string .= " " . $q;
+		}
+		$sth->execute($seq->id, $qual_string);
+
+	}
+	$sth->finish;
+        #print "End: Parse $fasta_reads_quality_file file\n";
+
+
+	
+
+}
+
+#################################
+#
+# Parse Assembly Bases (file: assembly.bases)
+#
+#################################
+if($run_options{'parse_assembly_bases'})
+{
+	#print "Start: Parse $fasta_bases_file file\n";
+
+	my $in  = Bio::SeqIO->new('-file' => "$fasta_bases_file",
+                         '-format' => 'Fasta');
+
+	$dbh->do("delete from contigs");
+
+	my $insert_query = "insert into contigs (contig_number, bases) VALUES (?, ?)";
+	my $sth = $dbh->prepare($insert_query);
+
+        while ( my $seq = $in->next_seq() )
+        {
+		my $contig_number;
+		if($contig_number =~ /contig_/)
+		{
+			($contig_number) = $seq->id =~ /(\d+)/;
+		} else
+		{
+			$contig_number = $seq->id;
+		}
+
+                $sth->execute($contig_number, $seq->seq);
+        }
+        $sth->finish;
+        #print "End: Parse $fasta_bases_file file\n";
+
+	
+}
+##END:  Parse assembly bases
+
+
+#################################
+#
+# Parse Assembly Quality (file: assembly.qual)
+#
+#################################
+if($run_options{'parse_assembly_qual'})
+{ #print "Start: Parse $fasta_qual_bases_file file\n";
+
+	my  $in  = Bio::SeqIO->new('-file' => "$fasta_qual_bases_file", '-format'=>'qual');
+
+	
+	$dbh->do("delete from contig_quality");
+	my $sth = $dbh->prepare("insert into contig_quality (contig_number, quality) VALUES (?, ?)");
+
+	while ( my $seq = $in->next_seq() )
+	{
+		my @quals = @{$seq->qual()};
+		my $qual_string = "";
+		foreach my $q (@quals)
+		{
+			$qual_string .= " " . $q;
+		}
+		$sth->execute($seq->id, $qual_string);
+	}
+}
+
+#################################
+#
+# Create Supercontigs (file: supercontig.fasta)
+#
+#################################
+if($run_options{'create_modified_fasta'})
+{
+
+        #print "Start: Create modified fasta file\n";
+
+
+	my $fastasuperin = Bio::SeqIO->new(-file=>">$supercontig_fasta_file", -format=>'fasta');
+	
+	my $linksh = $dbh->prepare( "
+                select contig_number,
+                super_id,
+                bases_in_super,
+                contigs_in_super,
+                ordinal_number,
+                contig_length,
+                gap_before_contig,
+                gap_after_contig,
+                contig_start_super_base,
+                modified_contig_start_base,
+                modified_bases_in_super
+                FROM
+                links WHERE
+		super_id = ?
+		ORDER BY ordinal_number");
+
+	my $superh = $dbh->prepare('select distinct super_id from links order by super_id');
+	$superh->execute();
+	my $findseqh = $dbh->prepare("select bases from contigs where contig_number = ?");
+
+	while(my $supercon = $superh->fetchrow_hashref)
+	{
+		my $seq;
+		my $seq_name = 'supercontig_' . $supercon->{super_id};
+
+		$linksh->execute($supercon->{super_id});
+
+		while(my $this_contig = $linksh->fetchrow_hashref)
+		{
+			my $contig_bases = '';
+			my $contig_name = 'contig_' . $this_contig->{contig_number};
+			$findseqh->execute($contig_name);
+			if($findseqh->rows > 0)
+			{
+				my $row = $findseqh->fetchrow_hashref;
+				$contig_bases = $row->{bases};	
+			} else
+			{
+				warn "ERROR: Bases for contig " . $this_contig->{contig_number} . " in supercontig " . $supercon->{super_id} . " not found!\n";
+				exit;
+				
+			}
+			my $num_placeholder = 0;
+			if($this_contig->{gap_before_contig} < 0)
+			{
+				$num_placeholder = $minimum_gap_length;
+			}else
+			{
+				$num_placeholder = $this_contig->{gap_before_contig};
+			}
+
+			for(my $i = 0;$i < $num_placeholder;$i++)
+			{
+				$seq .= 'N';
+			}
+			$seq .= uc($contig_bases);
+		}
+		my $super_seq = Bio::Seq->new(-display_id=>$seq_name, -seq=>$seq);
+		$fastasuperin->write_seq($super_seq);
+	}
+
+        #print "End: Create modified fasta file\n";
+
+
+}
+
+#################################
+#
+# Create modified reads (file: trimmed_reads.fasta)
+#
+#################################
+if($run_options{'create_modified_reads_fasta'})
+{
+        #print "Start: Create modified reads fasta file\n";
+
+	my $sequences = Bio::SeqIO->new('-file'         => "<$fasta_reads_bases_file",
+					'-format'       => "fasta");
+	open(READFASTA, ">", $modified_reads_fasta_file);
+        while(my $this_read =  $sequences->next_seq)
+	{
+		my $disp_id = $this_read->display_id;
+		$disp_id =~ s/ //g;
+		my $query = 'select read_name, first_base_of_trim, read_len_trim from reads_assembly where read_name = ' . $dbh->quote($disp_id);
+		my $rh = $dbh->prepare($query);
+		$rh->execute();
+		if(my $result = $rh->fetchrow_hashref)
+		{
+			my $start = $result->{first_base_of_trim} + 1;
+			my $end  = $result->{read_len_trim} + 1 + $result->{first_base_of_trim};
+			if($end > $this_read->length())
+			{
+				$end = $this_read->length();
+			}
+			print READFASTA ">" . $result->{read_name} . "\n";
+			print READFASTA $this_read->subseq($start, $end) . "\n";
+		}
+
+	}
+
+        #print "End: Create modified reads fasta file\n";
+}
+
+
+
+#################################
+#
+# Create Supercontig ORF from Contig ORF (file: gff/$organism_orfs.gff)
+#
+#################################
+if($run_options{'create_supercontig_orf_from_input'})
+{
+        #print "Start: Convert Contig Orf gff file to Supercontig Orf gff file\n";
+
+        open(ORF, "$orf_input_file") or die ("Can not open $orf_input_file");
+	open(ORFSUPER, '>', "$gff_supercontig_orf_output_file") or die ("Can not open $gff_supercontig_orf_output_file");
+        while (<ORF>)
+        {
+            my $line = $_;
+            my @this_line = split("\t", $line);
+	    my $contig_number = $this_line[0];
+	    my $source = $this_line[1];
+            my $feature = $this_line[2];
+            my $start = $this_line[3];
+            my $end = $this_line[4];
+	    my $score = $this_line[5];
+	    my $strand = $this_line[6];
+	    my $frame = $this_line[7];
+	    my $attr = $this_line[8];
+
+	    my @contig_number_arr = split("_", $contig_number);
+	    $contig_number = $contig_number_arr[1];
+            my $get_contig_pos_query = "select contig_number, super_id, contig_start_super_base, contig_length, modified_contig_start_base from links where contig_number = '" . $contig_number . "'";
+            my $sth = $dbh->prepare($get_contig_pos_query);
+            $sth->execute;
+	    my $links_array = $sth->fetchrow_hashref;
+	    my $new_start = 0;
+	    my $new_end = 0;
+
+	    if($minimum_gap_fg)
+	    {
+	      $new_start = $start + $links_array->{modified_contig_start_base};
+              $new_end = $end +  $links_array->{modified_contig_start_base};
+  	    } else
+	    {
+	      $new_start = $start + $links_array->{contig_start_super_base};
+	      $new_end = $end +  $links_array->{contig_start_super_base};
+	    }
+	    print ORFSUPER "supercontig_" . $links_array->{super_id} . "\t" .
+			   $source 	. "\t" .
+		   	   $feature 	. "\t" .
+			   $new_start	. "\t" .
+			   $new_end	. "\t" .
+			   $score	. "\t" .
+			   $strand	. "\t" .
+			   $frame	. "\t" .
+			   $attr	. "\n";
+
+        }
+
+        #print "Start: Convert Contig Orf gff file to Supercontig Orf gff file\n";
+}
+
+
+#################################
+#
+# Move old orfs over (file: $old_orf_database)
+#
+#################################
+if($run_options{'move_orfs_from_old'})
+{
+        #print "Start: Moving orfs from database: $old_orf_database to database: $organism\n";
+
+	my $old_database = $old_orf_database;
+	my $new_database = $organism;
+
+	my $odsn = "DBI:$driver:database=$old_database;host=$hostname;port=$port";
+	my $odbh = DBI->connect($odsn, $user, $password);
+
+	my $odrh = DBI->install_driver("mysql");
+
+	my $ndsn = "DBI:$driver:database=$new_database;host=$hostname;port=$port";
+	my $ndbh = DBI->connect($ndsn, $user, $password);
+	my $ndrh = DBI->install_driver("mysql");
+
+	my $debug = 1;
+	
+	my $transfer_annotation = 0;
+
+	
+	# determine the max insert id for new orfs and set it
+
+	my $maxidh = $odbh->prepare("select max(orfid)+1 as next_orf from orfs");
+	$maxidh->execute();
+	my $maxrow_hash = $maxidh->fetchrow_hashref;
+	my $next_id = $maxrow_hash->{next_orf};
+
+	if ($debug) {
+		print "Next new orfid is $next_id \n";
+	}
+	my $insidh = $ndbh->prepare("set insert_id=" . $next_id);
+	$insidh->execute();
+
+	my $get_orf_query = "select orfid, sequence, annotation, annotation_type, source, delete_fg, delete_reason, start, stop, direction, attributes, old_orf, orf_name, delete_user_id, last_updated from orfs order by orfid";
+
+	my $sth = $odbh->prepare($get_orf_query);
+	$sth->execute;
+
+
+	my $insert_ref = $ndbh->prepare("insert into orfs
+                   (orfid,
+                   sequence,
+                   annotation,
+                   annotation_type,
+                   source,
+                   delete_fg,
+                   delete_reason,
+                   contig,
+                   start,
+                   stop,
+                   direction,
+                   attributes,
+                   orf_name,
+                   delete_user_id,
+                   last_updated) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+	my $find_orfs_by_seq_h = $odbh->prepare("select orfid, delete_fg, delete_reason from orfs where sequence = ? order by orfid");
+
+	my $insert_reassign = $ndbh->prepare("insert into orf_reassign (old_orf, new_orf) VALUES (?, ?)");
+	my $annotation_select_h = $odbh->prepare("select id, userid, orfid, update_dt, annotation, notes, delete_fg, blessed_fg, qualifier, with_from, aspect, object_type, evidence_code, private_fg from annotation where orfid = ?");
+	my $annotation_insert_h = $ndbh->prepare("insert into annotation (id, userid, orfid, update_dt, annotation, notes, delete_fg, blessed_fg, qualifier, with_from, aspect, object_type, evidence_code, private_fg) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+	
+
+	# iterate through all old orfs
+	my $visited_hash;
+	while(my $this_row = $sth->fetchrow_hashref)
+	{
+		if( defined($visited_hash->{$this_row->{orfid}}) )
+		{
+			next;
+		}
+
+		$visited_hash->{$this_row->{orfid}} = 1;
+
+	        if($debug)
+	        {
+	                print "Checking:\t" . $this_row->{orfid} . "\n";
+	        }
+
+		# Is this orf marked as deleted in the previous assembly by a user?
+		my $mark_deleted = 'N';
+		if($this_row->{delete_reason} eq 'user annotated')
+		{
+			$mark_deleted = 'Y';
+		}
+	        # now iterate through all sequences and check if this sequence is in one of the contigs
+
+	        
+	        # Create a sequence object for the query string
+	        my $sequence_string_db = $this_row->{sequence};
+
+	        # Clean up the query string
+
+	        $sequence_string_db =~ s/[^ATGC]//ig;
+		my $this_orf_sequence = Bio::Seq->new ( -display_id     => $this_row->{orfid}, -seq=>$sequence_string_db);
+		
+		# Search for the sequence in the contigs
+		my $hit_array = $mbl->get_locations_from_contigs($sequence_string_db);
+
+	        if( !defined($hit_array) )
+	        {
+	                # Expire this orf with reason code, "disconnected"
+
+	                if($debug)
+	                {
+	                  print join("\t", "ORF", $this_row->{orfid}, "Current:disconnected", "Previous:" . $this_row->{delete_fg} . ':' . $this_row->{delete_reason}) . "\n";
+	                }
+				$insert_ref->execute($this_row->{orfid}, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, 'Y', 'disconnected', undef, undef, undef, undef, $this_row->{attributes}, $this_row->{orf_name}, undef, undef);
+
+			# Expire all other orfs that share this same sequence
+			$find_orfs_by_seq_h->execute($this_orf_sequence->seq);
+			while(my $seq_row = $find_orfs_by_seq_h->fetchrow_hashref)
+			{
+				if(defined($visited_hash->{$seq_row->{orfid}}))
+				{
+					next;
+				}
+
+				$visited_hash->{$seq_row->{orfid}} = 1;
+				$insert_ref->execute($seq_row->{orfid}, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, 'Y', 'disconnected', undef, undef, undef, undef, $this_row->{attributes}, $this_row->{orf_name}, undef, undef);
+
+	                	if($debug)
+		                {
+		                  print join("\t", "ORF", $seq_row->{orfid}, "Current:disconnected", "Previous:" . $seq_row->{delete_fg} . ':' . $seq_row->{delete_reason}) . "\n";
+		                }
+			}
+
+			# Do a blast search for this orf and see if it is found - TODO
+
+
+	        } elsif((scalar @$hit_array) > 1)
+	        {
+			my $num_hits = scalar @$hit_array;
+
+	                # we must then expire the ORFid and create new ORFid's, unless we can find some more orfs with the same sequence
+			$find_orfs_by_seq_h->execute($this_orf_sequence->seq);
+
+			# First check to see if we have more hits then orfs already defined
+			my $num_additional = 0;
+			if($num_hits > $find_orfs_by_seq_h->rows)
+			{
+				$num_additional = $num_hits - $find_orfs_by_seq_h->rows;
+			}
+
+	                if($debug)
+	                {
+	                        print join("\t", "ORF", $this_row->{orfid}, "Multiple HITS:", $num_hits, "Additional:", $num_additional) . "\n";
+	                }
+
+	                foreach my $this_hit(@$hit_array)
+	                {
+				my $delete_fg = 'N';
+				my $delete_reason = undef;
+				my $delete_user_id = undef;
+				my $last_updated = undef;
+				if($mark_deleted eq 'Y')
+				{
+					$delete_fg = 'Y';
+					$delete_reason = $this_row->{delete_reason};
+					$delete_user_id = $this_row->{delete_user_id};
+					$last_updated = $this_row->{last_updated};
+				}
+			
+				if($num_additional <= 0)
+				{
+					my $new_seq_match = $find_orfs_by_seq_h->fetchrow_hashref;
+					$insert_ref->execute($new_seq_match->{orfid}, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, $delete_fg, $delete_reason, $this_hit->{contig}, $this_hit->{start}, $this_hit->{stop}, $this_hit->{direction}, $this_row->{attributes}, $this_row->{orf_name}, $delete_user_id, $last_updated);
+
+					if($debug)
+					{
+						print join("\t", "ORF", $new_seq_match->{orfid}, "Current:Old Duplicate", "Previous:" . $new_seq_match->{delete_fg} . ':' . $new_seq_match->{delete_reason}) . "\n";
+					}
+					if($transfer_annotation)
+					{
+						$annotation_select_h->execute($this_row->{orfid});
+						while(my $annot_row = $annotation_select_h->fetchrow_hashref)
+						{
+							$annotation_insert_h->execute(undef, $annot_row->{userid}, $new_seq_match->{orfid}, $annot_row->{update_dt}, $annot_row->{annotation}, $annot_row->{notes}, $annot_row->{delete_fg}, $annot_row->{blessed_fg}, $annot_row->{qualifier}, $annot_row->{with_from}, $annot_row->{aspect}, $annot_row->{object_type}, $annot_row->{evidence_code}, $annot_row->{private_fg});
+						}
+					}
+					
+					$visited_hash->{$new_seq_match->{orfid}} = 1;
+					
+				} else
+				{
+					$num_additional--;
+					if($mark_deleted eq 'Y')
+					{
+						$delete_fg = 'Y';
+						$delete_reason = $this_row->{delete_reason};
+						$delete_user_id = $this_row->{delete_user_id};
+						$last_updated = $this_row->{last_updated};
+					}
+
+		                        $insert_ref->execute($next_id, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, $delete_fg, $delete_reason, $this_hit->{contig}, $this_hit->{start}, $this_hit->{stop}, $this_hit->{direction}, $this_row->{attributes}, $this_row->{orf_name}, $delete_user_id, $last_updated);
+
+		                        $next_id++;
+		                        my $last_insert_id = $ndbh->{'mysql_insertid'};
+
+		                        $insert_reassign->execute($this_row->{orfid}, $last_insert_id);
+					# Transfer the annotations and blast results - TODO (blast results)
+					
+					$visited_hash->{$last_insert_id} = 1;
+					if($transfer_annotation)
+					{
+						$annotation_select_h->execute($this_row->{orfid});
+						while(my $annot_row = $annotation_select_h->fetchrow_hashref)
+						{
+							$annotation_insert_h->execute(undef, $annot_row->{userid}, $last_insert_id, $annot_row->{update_dt}, $annot_row->{annotation}, $annot_row->{notes}, $annot_row->{delete_fg}, $annot_row->{blessed_fg}, $annot_row->{qualifier}, $annot_row->{with_from}, $annot_row->{aspect}, $annot_row->{object_type}, $annot_row->{evidence_code}, $annot_row->{private_fg});
+						}
+					}
+
+					if($debug)
+					{
+						print join("\t", "ORF", "OLD:", $this_row->{orfid}, "NEW:", $last_insert_id) . "\n";
+					}
+				}
+			}
+
+			# Mark all the rest as duplicates
+
+			while(my $new_seq_match = $find_orfs_by_seq_h->fetchrow_hashref)
+			{
+				$insert_ref->execute($new_seq_match->{orfid}, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, "Y", "duplicate", undef, undef, undef, undef, $this_row->{attributes}, $this_row->{orf_name}, undef, undef);
+				$visited_hash->{$new_seq_match->{orfid}} = 1;
+				if($debug)
+				{
+					print join("\t", "ORF", $new_seq_match->{orfid}, "Current:duplicate", "Previous:" . $new_seq_match->{delete_fg} . ':' . $new_seq_match->{delete_reason}) . "\n";
+				}
+			}
+
+	        } else
+	        {
+			
+	                # it is the only hit, so we can just use this orf id
+			my $delete_fg = 'N';
+			my $delete_reason = undef;
+			my $delete_user_id = undef;
+			my $last_updated = undef;
+			if($mark_deleted eq 'Y')
+			{
+				$delete_fg = 'Y';
+				$delete_reason = $this_row->{delete_reason};
+				$delete_user_id = $this_row->{delete_user_id};
+				$last_updated = $this_row->{last_updated};
+			}
+
+
+                        $insert_ref->execute( $this_row->{orfid}, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, $delete_fg, $delete_reason, $hit_array->[0]->{contig},  $hit_array->[0]->{start}, $hit_array->[0]->{stop}, $hit_array->[0]->{direction}, $this_row->{attributes}, $this_row->{orf_name}, $delete_user_id, $last_updated);
+			$visited_hash->{$this_row->{orfid}} = 1;
+			
+			# Transfer annotation and blast hits - TODO (blast_hits)
+			if($transfer_annotation)
+			{
+				$annotation_select_h->execute($this_row->{orfid});
+				while(my $annot_row = $annotation_select_h->fetchrow_hashref)
+				{
+					$annotation_insert_h->execute(undef, $annot_row->{userid}, $this_row->{orfid}, $annot_row->{update_dt}, $annot_row->{annotation}, $annot_row->{notes}, $annot_row->{delete_fg}, $annot_row->{blessed_fg}, $annot_row->{qualifier}, $annot_row->{with_from}, $annot_row->{aspect}, $annot_row->{object_type}, $annot_row->{evidence_code}, $annot_row->{private_fg});
+				}
+			}
+			
+			# Now find other orfs that are the same and mark them as duplicated if this orf is not marked as deleted
+			if($delete_fg eq "N")
+			{
+				$find_orfs_by_seq_h->execute($this_orf_sequence->seq);
+				while(my $seq_row = $find_orfs_by_seq_h->fetchrow_hashref)
+				{
+					if( defined($visited_hash->{$seq_row->{orfid}}) )
+					{
+						next;
+					}
+					$insert_ref->execute( $seq_row->{orfid}, $this_orf_sequence->seq, $this_row->{annotation}, $this_row->{annotation_type}, $this_row->{source}, "Y", "duplicate", $hit_array->[0]->{contig},  $hit_array->[0]->{start}, $hit_array->[0]->{stop}, $hit_array->[0]->{direction}, $this_row->{attributes}, $this_row->{orf_name}, undef, undef);
+					if($debug)
+					{
+						print join("\t", "ORF", $seq_row->{orfid}, "Current:duplicate", "Previous:" . $seq_row->{delete_fg} . ':' . $seq_row->{delete_reason}) . "\n";
+					}
+					$visited_hash->{$seq_row->{orfid}} = 1;
+				}
+			}
+
+	        }
+
+
+	} # end checking all db rows
+
+        #print "End: Moving orfs from database: $old_database to database: $organism\n";
+
+}
+#################################
+#
+# Move orfs from old mummer (file: $old_orf_database)
+# DOES NOT RUN YET
+#################################
+if($run_options{'move_orfs_from_old_mummer'})
+{
+        #print "Start: Moving orfs from database: $old_orf_database to database: $organism\n";
+                                                                                                                                                                                                                                                       
+        my $old_database = $old_orf_database;
+        my $new_database = $organism;
+                                                                                                                                                                                                                                                       
+        my $odsn = "DBI:$driver:database=$old_database;host=$hostname;port=$port";
+        my $odbh = DBI->connect($odsn, $user, $password);
+                                                                                                                                                                                                                                                       
+        my $odrh = DBI->install_driver("mysql");
+                                                                                                                                                                                                                                                       
+        my $ndsn = "DBI:$driver:database=$new_database;host=$hostname;port=$port";
+        my $ndbh = DBI->connect($ndsn, $user, $password);
+        my $ndrh = DBI->install_driver("mysql");
+                                                                                                                                                                                                                                                       
+        my $debug = 1;
+                                                                                                                                                                                                                                                       
+        # determine the max insert id for new orfs and set it
+                                                                                                                                                                                                                                                       
+        my $maxidh = $odbh->prepare("select max(orfid)+1 as next_orf from orfs");
+        $maxidh->execute();
+        my $maxrow_hash = $maxidh->fetchrow_hashref;
+        my $next_id = $maxrow_hash->{next_orf};
+                                                                                                                                                                                                                                                       
+		if ($debug)
+		{
+        	print "Next new orfid is $next_id \n";
+		}
+        my $insidh = $ndbh->prepare("set insert_id=" . $next_id);
+        $insidh->execute();
+
+	# Create a temp file of all of the old orfs
+
+	my $orf_tempfile = $temp_dir . '/' . $organism . "_orfs_tmp.fasta";
+	my $orf_mummerfile = $temp_dir . '/' . $organism . "_orfs_tmp.mummer";
+
+	open(ORFTEMP, ">", $orf_tempfile);
+	my $query = 'select orfid, sequence from orfs order by orfid';
+	my $handler = $odbh->prepare($query);
+	$handler->execute();
+ 
+	while(my $row = $handler->fetchrow_hashref)
+	{
+	        print ORFTEMP ">" . $row->{orfid} . "\n" . $row->{sequence} . "\n";
+	}
+
+#	system($mummer_bin . " -maxmatch -n -l 100 -b -s -c -F -L $fasta_bases_file $orf_tempfile  > $orf_mummerfile");
+
+	open(MUMMERFILE, $orf_mummerfile);
+
+	my $contig;
+	my $orf_id;
+	my $last_orfid;
+	my $orf_length;
+	my $dir;
+	my $orf_hits;
+	my @hit_array;
+
+	while(<MUMMERFILE>)
+	{
+                my $line = $_;
+                if($line =~ /^>/) # This is a header line for a new orf
+                {
+                        ($orf_id, $orf_length) = $line =~ /^> (\d+).*  Len = (\d+)/;
+                        if($line =~ /Reverse$/)
+                        {
+                                $dir = "-";
+                        } else
+                        {
+                                $dir = "+";
+                        }
+
+                } elsif( $line =~ /^  (.+)$/)  # This is a match line
+                {
+                        my $stop = '';
+                        my (undef, $contig, $start, $orf_start, $size) = split(/\s+/, $line);
+			if($size == $orf_length) # If this is a full sized orf
+			{
+	                        if($dir eq "-")
+	                        {
+	                                $stop = $start;
+	                                $start = $stop - $size;
+	                        } else
+	                        {
+	                                $stop = $start + $size;
+	                        }
+
+				#print join("\t", $orf_id, $contig, $start, $stop, $dir) . "\n";
+				#my @arrayref = \$orf_hits->{$orf_id};
+				#push($orf_hits->{$orf_id}, [$orf_id, $contig, $start, $stop, $dir]);
+
+			}
+                                                                                                                                                                                                                                                       
+                } else # This is a sequence line
+		{
+
+		}
+
+
+	}
+
+	while(my ($key, $val) = each %$orf_hits)
+	{
+		my @arr = @$val;
+		print join("\t", $arr[0], $arr[1], $arr[2], $arr[3], $arr[4]) . "\n";
+	}
+
+}
+
+#################################
+#
+# Find ORFs with GLIMMER (fasta training file: tables/$organism.fasta)
+##	requires training file
+#
+#################################
+if($run_options{'find_orfs_glimmer'})
+{
+
+        #print "Start: Discover ORFs via GLIMMER2\n";
+	my $glimmer_tmp_dir = tempdir(CLEANUP => 1);
+	my $glimmer_train_output = $glimmer_tmp_dir . "/" . "glimmer.out";
+
+	#Old glimmer2 syntax
+	#system("$build_icm_bin -f < $fasta_train_file > $glimmer_train_output");
+	system("$build_icm_bin $glimmer_train_output < $fasta_train_file");
+
+	# Create fasta file of the genome
+	my $contigsq = $dbh->prepare("select contig_number, bases from contigs");
+	$contigsq->execute();
+	my $orfins = $dbh->prepare("insert into orfs (sequence, source, delete_fg, contig, start, stop, direction, old_orf) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?)");
+	my $tmp_file = $glimmer_tmp_dir . '/' . $organism . '_tmp.fas';
+	while(my $row = $contigsq->fetchrow_hashref)
+	{
+
+		my $seq = Bio::Seq->new(-display_id=>$row->{contig_number}, -seq=>$row->{bases});
+		my $tmpseqio = Bio::SeqIO->new(-file=>">$tmp_file", -format=>'fasta');
+		$tmpseqio->write_seq($seq);
+		#Glimmer2 syntax
+		#my $glimmer_out_file = "$glimmer_tmp_dir/$organism" . '_glimmer.out';
+		#system($glimmer_bin . ' ' . $tmp_file . ' ' . $glimmer_train_output . " +f -l -g $minimum_orf_length  > $glimmer_out_file");
+		my $glimmer_out_tag = "$glimmer_tmp_dir/$organism";
+		system("$glimmer_bin -f -l -g $minimum_orf_length $tmp_file $glimmer_train_output $glimmer_out_tag");
+
+		open (ORFILE, "<", $glimmer_out_tag . ".predict");
+		my $chk_query = "select orfid, delete_fg from orfs
+                                  WHERE
+                                  contig = ? AND
+                                  start = ? AND
+                                  stop = ? AND
+                                  direction = ? AND
+                                  (start % 3) = ?";
+                my $chk_h = $dbh->prepare($chk_query);
+
+		while (defined (my $line = <ORFILE>))
+		{
+			#print $line;
+			#Glimmer2 syntax
+			#if ($line =~/\[/)
+			#{
+ 				#$line=~/\s+\d+\s+(\d+)\s+(\d+)\s+\[([-+])\d\s.+/;
+				#my $start = $1;
+				#my $stop = $2;
+				#my $dir = $3;
+			if ($line !~ /^>/)
+			{
+				$line =~ /\w+\s+(\w+)\s+(\w+)\s+([+-]\w+)\s+(\w+\.+\w+)/;
+				my $start = $1;
+				my $stop = $2;
+				my $strand = $3;
+				my $dir = substr($strand, 0, 1);
+				my $other = $4;
+
+				my $orf_seq = '';
+				if($start > $stop)
+				{
+					my $tmpend = $stop;
+					$stop = $start;
+					$start = $tmpend;
+				}
+				if($dir eq "+" && $seq->length() >= $stop+3)
+				{
+					#include stop codon in the orf
+					$stop = $stop+3;
+				}
+
+				if($dir eq "-" && $start > 3)
+				{
+					#include stop codon in the orf
+					$start = $start - 3;
+				}
+				# print $seq->display_id . "\tGLIMMER\tORF\t$1\t$2\t.\t$3\t0\n";
+				if($dir eq "-")
+				{
+					$orf_seq = uc($seq->trunc($start, $stop)->revcom()->seq()) . "\n";
+				} else
+				{
+					$orf_seq = uc($seq->subseq($start, $stop)) . "\n";
+				}
+				# First see if we already have this orf in the database
+#				debug(print join("\t", $start, $stop, $dir)); #### TEMPORARY TEST
+				$chk_h->execute( $seq->display_id, $start, $stop, $dir, $start%3);
+
+				if($chk_h->rows() > 0)
+				{
+#					debug("Orf already exists in the database");
+#					debug("as Orf # " . $chk_h->fetchrow_hashref->{orfid});
+					# do nothing
+				} elsif( ($stop - $start) < $minimum_orf_length)
+				{
+#					debug("Orf is too small");
+					# do nothing
+				} elsif( ($stop - $start) > $maximum_orf_length)
+				{
+#					debug("Orf id too large");
+					# do nothing
+				} elsif( !($orf_seq =~ /^atg/i) &&  $remove_orf_false_start)
+				{
+#					debug("Orf does not have a start codon");
+					# do nothing
+				} else
+				{
+					$orfins->execute($orf_seq, 'GLIMMER3', 'N', $seq->display_id, $start, $stop, $dir, 'N' );
+#					print join("\t", $orf_seq, "\n",  $seq->display_id, $start, $stop, $dir) . "\n";
+				}
+			}
+		}
+
+	}
+        #print "End: Discover ORFs via GLIMMER\n";
+
+
+}
+#######END FIND ORFS VIA GLIMMER############
+
+
+#################################
+#
+# Find and Remove Invalid ORFs
+#
+#################################
+if($run_options{'delete_invalid_orfs'})
+{
+
+        #print "Start: Delete invalid Orfs\n";
+
+	# First delete all called orfs that are too large (> 20000)
+		if ($debug) { print "       Deleting Orfs of invalid size\n";}
+
+	my $delh = $dbh->prepare("update orfs set delete_fg = 'Y', delete_reason='invalid size' where ((stop-start > " . $maximum_orf_length  . ") OR (stop-start < " . $minimum_orf_length . ")) AND delete_fg = 'N'");
+	$delh->execute();
+
+	# Now check for false starts and stop codons within reading frame
+        if ($debug) {print "       Deleting Orfs with false stops and stop codons within reading frame\n";}
+
+	my $get_orf_query = "SELECT orfid,
+	                        sequence,
+	                        annotation,
+	                        annotation_type,
+	                        source,
+	                        delete_fg ,
+	                        delete_reason,
+	                        contig,
+	                        start,
+	                        stop,
+	                        direction
+	                        FROM orfs
+	                        where sequence is not NULL and contig is not null ";
+	my $sth = $dbh->prepare($get_orf_query);
+	$sth->execute;
+	while(my $this_row = $sth->fetchrow_hashref)
+	{
+	        # Bring the sequence into a bioperl object
+	        my $this_orf_sequence = Bio::Seq->new ( -display_id     => $this_row->{ORFid},
+	                                                -seq            => $this_row->{sequence}
+	                                                );
+
+	        if( !($this_orf_sequence->subseq(1,3) =~ /^atg/i) && $remove_orf_false_start)
+	        {
+	                #print "Orf\t" . $this_row->{orfid} . " \t is NOT a valid translating sequence.\tReason:\t" . "false start\n";
+	                my $update_query = "UPDATE orfs set delete_fg='Y', delete_reason='false start'
+	                                WHERE orfid = '" . $this_row->{orfid} . "'";
+	                my $udq = $dbh->prepare($update_query);
+	                $udq->execute;
+	        } else
+	        {
+	                # Now check for a stop in middle
+	                my $start = 1;
+	                my $valid = 1;
+	                my $not_valid_reason = '';
+	                my $seq_length = $this_orf_sequence->length();
+	                while( ($start <= ($seq_length -3)) && ($valid) )
+	                {
+	                        my $check_codon = $this_orf_sequence->subseq($start, $start+2);
+				#print $check_codon . "\n";
+	                        if( ($check_codon eq 'TAA') ||
+	                            ($check_codon eq 'TAG') ||
+	                            ($check_codon eq 'TGA') )
+	                        {
+	                                #print "STOP";
+	                                # We have a stop codon in the middle of our sequence
+	                                $valid = 0;
+	                                $not_valid_reason = 'mid stop';
+	                        }
+	                        $start = $start+3;
+	                }
+
+	                # check that it ends in a stop codon
+	                my $end_seq =  uc(substr($this_row->{sequence}, -3));
+
+	                if($valid && $remove_orf_no_stop)
+	                {
+	                        if( ($end_seq eq 'TAA') ||
+	                            ($end_seq eq 'TAG') ||
+	                            ($end_seq eq 'TGA') )
+	                        {
+	                                # We are good or we already have invalidated the sequence
+	                        }else
+	                        {
+	                                # we are missing a stop codon, so not a valid orf
+	                                $not_valid_reason = 'no stop';
+	                                $valid = 0;
+	                        }
+	                }
+
+	                # Get mark orfs that are < minimum_orf_length or > maximum_orf_length as invalid size
+	                if($valid)
+	                {
+	                        my $size = length($this_row->{sequence});
+	                        if( ($size < $minimum_orf_length) || ($size > $maximum_orf_length) )
+	                        {
+	                                $not_valid_reason = 'invalid size';
+	                                $valid = 0;
+	                        }
+	                }
+	                # if it is still valid, we are ok, otherwise print out the reason
+	                if($valid)
+	                {
+	                        #print "Orf\t" . $this_row->{orfid} . " \t is a valid translating sequence.\n";
+	                } else
+	                {
+	                         #print "Orf\t" . $this_row->{orfid} .
+	                        #" \t is NOT a valid translating sequence.\tReason:\t" .
+	                        #$not_valid_reason . "\n";
+	                        my $update_query = "UPDATE orfs set delete_fg='Y',
+	                                delete_reason='" . $not_valid_reason . "'
+	                                WHERE orfid = '" . $this_row->{orfid} . "'";
+	                        #print $update_query . "\n";
+	                        my $udq = $dbh->prepare($update_query);
+	                        $udq->execute;
+	                } # end if $valid
+	        } # end else ne 'ATG'
+	} # end while
+
+
+	# Now check for and set delete_fg for orfs that are duplicates of other orfs
+	# or are entierly within another orf. If one of them is an old orf
+	# keep that one
+
+	# Now we will mark all duplicate orfs. We will always keep the lower numbered orf
+	# as the correct orf, and we will insert into the orf_reassign table to keep track of
+	# these orfs
+	if ($debug) { print "       Deleting Duplicated Orfs or Orfs internal to other Orfs\n";}
+
+	my $last = 1;
+	my $last_orf_id = 0;
+
+	while($last)
+	{
+	        # pick one orfs higher then the last orf
+	        my $orf_query = "SELECT orfid,
+	                        sequence,
+	                        annotation,
+	                        annotation_type,
+	                        source,
+	                        delete_fg ,
+	                        delete_reason,
+	                        contig,
+	                        start,
+	                        stop,
+	                        direction
+	                        FROM orfs
+	                        where delete_fg = 'N' AND
+	                        orfid > " . $last_orf_id . " order by orfid LIMIT 1";
+	        my $sth = $dbh->prepare($orf_query);
+	        $sth->execute;
+
+	        my $this_row = $sth->fetchrow_hashref;
+
+	        if($this_row)
+	        {
+	                $last_orf_id = $this_row->{orfid};
+
+	                my $find_query = "select orfid from orfs WHERE
+	                                contig = '" . $this_row->{contig}       . "' AND
+	                                start  = '" . $this_row->{start}        . "' AND
+	                                stop  = '" . $this_row->{stop}          . "' AND
+	                                direction  = '" . $this_row->{direction}. "' AND
+	                                orfid != '" . $this_row->{orfid} . "' AND delete_fg = 'N'";
+	                my $findh = $dbh->prepare($find_query);
+	                $findh->execute;
+	                print "ORF\t" . $this_row->{orfid} . "\t duplicates: " . $findh->rows . "\n";
+
+	                while(my $find_row = $findh->fetchrow_hashref)
+	                {
+	                        my $insert_query = "INSERT into orf_reassign (old_orf, new_orf) VALUES
+	                                                ('" . $find_row->{orfid} . "', '" .
+	                                                $this_row->{orfid} . "')";
+	                        my $update_query = "UPDATE orfs set delete_fg = 'Y',
+	                                                delete_reason = 'duplicate'
+	                                                where orfid = '" . $find_row->{orfid} . "' AND delete_fg = 'N'";
+	                        my $insh = $dbh->prepare($insert_query);
+	                        $insh->execute;
+	                        my $updh = $dbh->prepare($update_query);
+	                        $updh->execute;
+	                }
+
+	        } else
+	        {
+	                $last = 0;
+	        }
+
+	}
+
+
+	# we will select all orfs which are not deleted that are greater then the last orf
+	# we looked at and then grab one record and update all orfs that follow the dulicate
+	# criteria
+
+	my $last = 1;
+	my $last_orf_id = 0 ;
+	my $update_query = "UPDATE orfs set delete_fg = 'Y',
+		delete_reason = 'within other'
+		WHERE
+		contig = ? AND
+		start >= ? AND
+		stop <= ? AND
+		direction = ? AND
+		(start % 3) = ? AND
+		delete_fg = 'N' AND
+		orfid != ?";
+	my $updh = $dbh->prepare($update_query);
+	my $orf_query = "SELECT orfid,
+                                sequence,
+                                annotation,
+                                annotation_type,
+                                source,
+                                delete_fg ,
+                                delete_reason,
+                                contig,
+                                start,
+                                stop,
+                                direction
+                                FROM orfs
+                                where delete_fg = 'N' AND
+                                orfid > ? order by orfid LIMIT 1";
+                #print $orf_query . "\n\n";
+	my $sth = $dbh->prepare($orf_query);
+
+
+	while($last)
+	{
+		if($debug >= 5)
+		{
+	        	print $orf_query . "\n\n";
+		}
+	        $sth->execute($last_orf_id);;
+
+	        my $this_row = $sth->fetchrow_hashref;
+
+	        if($this_row)
+	        {
+	                $last_orf_id = $this_row->{orfid};
+
+	                $updh->execute($this_row->{contig}, $this_row->{start}, $this_row->{stop}, $this_row->{direction}, $this_row->{start}%3,  $this_row->{orfid});
+			if($debug >= 5)
+			{
+		                print $update_query;
+		                print "\n\n";
+			}
+	                print "ORF\t" . $this_row->{orfid} . "\t within: " . $updh->rows;
+	                print "\n";
+	        }else
+	        {
+	                $last = 0;
+	        }
+
+	}# end if ($last)
+
+        #print "End: Delete invalid Orfs\n";
+
+}
+
+######END REMOVE INVALID ORFS##############
+
+#################################
+#
+# Delete Unlikely ORFs
+#
+## Always ask first
+#################################
+if($run_options{'delete_unlikely_orfs'})
+{
+	my $orfs = $dbh->prepare("select orfid, delete_fg, delete_reason, contig, start, stop, direction, TestCode, CodonPreference, GeneScan from orfs where delete_fg = 'N' order by orfid");
+#	my $blasth = $dbh->prepare("select br.idname, br.evalue, db.name, st.type from blast_results br, sequence_type st, db where db.id = br.db AND st.id = br.sequence_type_id AND st.type = 'orf' AND db.name IN ('nr', 'swissprot', 'Pfam_ls') AND (description not like '%ATCC 50803%' OR description like '%gb|%') AND evalue < 1e-2 order by evalue AND idname = ?");
+	my $blasth = $dbh->prepare("select br.idname from blast_results br where br.sequence_type_id = 2 AND br.db IN (2,5,4,3) AND (description not like '%ATCC 50803%' OR description like '%gb|%') AND evalue < 1e-2 AND idname = ? order by evalue");
+
+	my $find_external = $dbh->prepare("select orfid from orfs where contig = ? AND start <= ? AND stop >= ? AND delete_fg = 'N' AND orfid != ?");
+	my $find_overlapping = $dbh->prepare("select orfid from orfs where contig = ? AND ( (start between ? AND ?) OR (stop between ? AND ?) ) AND orfid != ?");
+	my $delete_orf = $dbh->prepare("update orfs set delete_fg = 'Y', delete_reason = 'overlapping orf' where orfid = ?");
+
+
+	my $num_deleted = 0;
+	
+	$orfs->execute();
+	while(my $row = $orfs->fetchrow_hashref)
+	{
+		my $orfid = $row->{orfid};
+		print "Checking Orf $orfid\n";
+		
+		# Check if we are internal to another orf
+		$find_external->execute($row->{contig}, $row->{start}, $row->{stop}, $orfid);
+		if($find_external->rows > 0)
+		{
+			# There are some orfs that are external to me
+			# Check if my orf has a good hit
+			my $internal_good_hit = 0;
+			my $external_good_hit = 0;
+			$blasth->execute($orfid);
+			if($blasth->rows > 0)
+			{
+				$internal_good_hit = 1;
+			}
+			if(!$internal_good_hit)
+			{
+				while(my $external = $find_external->fetchrow_hashref)
+				{
+					$blasth->execute($external->{orfid});
+					if($blasth->rows > 0)
+					{
+						$external_good_hit = 1;
+					}
+				}
+				if($external_good_hit)
+				{
+					$num_deleted++;
+					print "Delete $orfid for internal, Total Deleted: $num_deleted\n";
+					$delete_orf->execute($orfid);
+				}
+			}
+			
+		}
+	}
+
+	# Now do overlapping ones
+	$orfs->execute();
+	while(my $row = $orfs->fetchrow_hashref)
+	{
+		my $orfid = $row->{orfid};
+		print "Checking Orf for overlapping : $orfid\n";
+                                                                                                                                                                                                                                                     
+                # Check if we are overlapping to another orf
+                $find_overlapping->execute($row->{contig}, $row->{start}, $row->{stop}, $row->{start}, $row->{stop}, $orfid);
+                if($find_overlapping->rows > 0)
+                {
+                        # There are some orfs that are external to me
+                        # Check if my orf has a good hit
+                        my $internal_good_hit = 0;
+                        my $external_good_hit = 0;
+                        $blasth->execute($orfid);
+                        if($blasth->rows > 0)
+                        {
+                                $internal_good_hit = 1;
+                        }
+                        if(!$internal_good_hit)
+                        {
+                                while(my $external = $find_overlapping->fetchrow_hashref)
+                                {
+                                        $blasth->execute($external->{orfid});
+                                        if($blasth->rows > 0)
+                                        {
+                                                $external_good_hit = 1;
+                                        }
+                                }
+                                if($external_good_hit)
+                                {
+                                        $num_deleted++;
+                                        print "Delete $orfid for overlapping, Total Deleted: $num_deleted\n";
+					$delete_orf->execute($orfid);
+                                }
+			}
+		}
+	}
+	
+}
+#####END DELETE UNLIKELY ORFS###########
+
+
+
+#################################
+#
+# Run the ORF testcode and genescan
+#
+# 	Needs the training set: $fasta_train_file
+#################################
+if($run_options{'run_orf_tests'})
+{
+
+	# This will run testcode, and genescan on each orf in the database and insert those values inside the database
+
+	# create the codon usage table
+	system("$cusp_bin -sequence $fasta_train_file -outfile $cusp_codon_file");
+
+	# Get all orfs in the database and their sequence
+	my $query = "
+        	select orfid,
+		sequence,
+	        contig,
+	        start,
+	        stop,
+	        direction
+	        FROM
+	        orfs where sequence != '' AND sequence is not null AND delete_fg = 'N'";
+	my $sth = $dbh->prepare($query);
+	$sth->execute;
+
+
+        my $udquery =   "UPDATE orfs set TestCode = ? ,
+                         TestScore = ? ,
+                         GeneScan = ? ,
+                         GeneScanScore = ? ,
+                         CodonUsage = ? ,
+                         CodonPreferenceScore = ? ,
+                         CodonPreference = ?
+                         WHERE orfid = ?";
+
+	my $udh = $dbh->prepare($udquery);
+
+	while(my $this_row = $sth->fetchrow_hashref)
+	{
+		# Create a temp file to store the sequence in
+		my $tempoutfile = "$temp_dir/outfile.tmp";
+
+		open(TMPFILE, ">$temp_dir/tmp.seq") or die ("Can not open temp file for testcode prediction");
+		print TMPFILE ">temp\n";
+		print TMPFILE $this_row->{sequence};
+
+
+		# Now check Testcode using the testcode_unix package
+
+		system('echo "$temp_dir/tmp.seq 100 1" | ' . $testcode_unix_bin );
+
+		my $testcode_result = 0;
+		my $testcode_values = 0;
+		my $testcode_average = 0;
+		my $test_result = 'F';
+		open(RESULTTCODE, "$temp_dir/tmp_tcode_frd.dat");
+		while(<RESULTTCODE>)
+		{
+			$testcode_result = $testcode_result + $_;
+			$testcode_values++;
+		}
+
+		$testcode_average = $testcode_result / $testcode_values;
+		if($testcode_average >= 9.7)
+		{
+			$test_result = 'P';
+		}else
+		{
+			$test_result = 'F';
+		}
+
+		# Now check the GeneScan output from the testcode_unix package
+
+                my $genescan_result = 0;
+                my $genescan_values = 0;
+                my $genescan_average = 0;
+		my $gene_result = 'F';
+
+		open(RESULTGSCAN, "$temp_dir/tmp_gscan.dat");
+                while(<RESULTGSCAN>)
+                {
+                        $genescan_result = $genescan_result + $_;
+                        $genescan_values++;
+                }
+
+                $genescan_average = $genescan_result / $genescan_values;
+                if($genescan_average >= 4.0)
+                {
+                        $gene_result = 'P';
+                }else
+                {
+                        $gene_result = 'F';
+                }
+
+
+
+
+		my $cusage_program = "$chips_bin -seqall $temp_dir/tmp.seq -outfile $temp_dir/outfile.tmp";
+                system($cusage_program);
+
+                # now parse this file
+                open (RESULT, "$tempoutfile");
+		my $codon_usage_score = 0;
+
+                while(<RESULT>)
+                {
+                        my $this_line = $_;
+                        (undef, undef, $codon_usage_score) = split(" ", $this_line);
+                }
+                close(RESULT);
+
+
+		# Now check codon usage /adaptation index
+
+		my $cai_program = "$cai_bin -seqall $temp_dir/tmp.seq -outfile $temp_dir/outfile.tmp -cfile $cusp_codon_file -sbegin1 1";
+		system($cai_program);
+
+                # now parse this file
+                open (RESULT, "$tempoutfile");
+                my $cai_result_1 = 0;
+                while(<RESULT>)
+                {
+                        my $this_line = $_;
+			(undef, undef, undef, $cai_result_1) = split(" ", $this_line);
+		}
+		close(RESULT);
+
+		# Second Frame
+                my $cai_program = "$cai_bin -seqall $temp_dir/tmp.seq -outfile $temp_dir/outfile.tmp -cfile $cusp_codon_file -sbegin1 2";
+                system($cai_program);
+
+                # now parse this file
+                open (RESULT, "$tempoutfile");
+                my $cai_result_2 = 0;
+                while(<RESULT>)
+                {
+                        my $this_line = $_;
+                        (undef, undef, undef, $cai_result_2) = split(" ", $this_line);
+                }
+                close(RESULT);
+
+		# Third Frame
+                my $cai_program = "$cai_bin -seqall $temp_dir/tmp.seq -outfile $temp_dir/outfile.tmp -cfile $cusp_codon_file -sbegin1 3";
+                system($cai_program);
+
+                # now parse this file
+                open (RESULT, "$tempoutfile");
+                my $cai_result_3 = 0;
+                while(<RESULT>)
+                {
+                        my $this_line = $_;
+                        (undef, undef, undef, $cai_result_3) = split(" ", $this_line);
+                }
+                close(RESULT);
+
+
+
+		my $cai_test = 'F';
+
+		if( ($cai_result_1 > $cai_result_2) &&
+		    ($cai_result_1 > $cai_result_3) )
+		{
+			$cai_test = 'P';
+		}else
+		{
+			$cai_test = 'F';
+		}
+		#print $cai_result_1 . "\n";
+                #print $cai_result_2 . "\n";
+                #print $cai_result_3 . "\n" . "\n\n";
+
+                $udh->execute($test_result, $testcode_average, $gene_result, $genescan_average, $codon_usage_score, $cai_result_1, $cai_test, $this_row->{orfid});
+
+
+	}
+
+
+}
+
+
+#################################
+#
+# Parse Sage Input (file: $sage_file)
+#
+#################################
+if($run_options{'create_sage_from_file'})
+{
+        #print "Start: Parsing Sage Input File\n";
+
+  open(SAGEFILE, "$sage_dir" . "$sage_file") or die("Can not open sage file $sage_file");
+
+  my $first_line = 1;
+  my @library_names;
+
+  # Delete from sage_tags and sage_results;
+  $dbh->prepare('delete from sage_tags')->execute();
+  $dbh->prepare('delete from sage_results')->execute();
+    my $insert_tag_query = "insert into sage_tags (tagID, sequence)
+                                VALUES (?, ?)";
+    my $insert_tagh = $dbh->prepare($insert_tag_query);
+    my $insert_result_query = "insert into sage_results (tagID, library, result)
+                                VALUES (?, ?, ?)";
+    my $insert_resulth = $dbh->prepare($insert_result_query);
+
+	my $sum_ins_q = $dbh->prepare("insert into sage_results_summary (tagid, sequence) VALUES (?, ?)");
+
+  while(<SAGEFILE>)
+  {
+    chop;
+    my $line = $_;
+    my @sage_array = split("\t", $line);
+
+    # Get library names from first line of array
+    if($first_line)
+    {
+      my $count = 0;
+      foreach my $lib_name (@sage_array)
+      {
+        if($count > 1)
+	{
+	  push(@library_names, $lib_name)
+	}
+
+        $count++;
+      }
+      $first_line = 0;
+
+	# Remove the summary table
+	$dbh->do("drop table sage_results_summary");
+	my $create_q = "CREATE TABLE sage_results_summary (tagid int NOT NULL, sequence varchar(30), one_rule char(1) NOT NULL default 'N'";
+	foreach my $libname (@library_names)
+	{
+		$create_q .= ", $libname int NOT NULL default 0"
+	}
+	$create_q .= ", PRIMARY KEY (tagid), KEY sage_results_summary_one_rule (one_rule)";
+
+	foreach my $libname (@library_names)
+	{
+		$create_q .= ", KEY sage_results_summary_" . $libname . " ($libname)";
+	}
+	$create_q .= ")";
+
+	$dbh->do($create_q);
+
+
+
+    } else {
+
+      # insert the tag values, if they are already in the database they should not insert
+      # since they are flaged as unique in the database
+
+      $insert_tagh->execute($sage_array[0], $sage_array[1]);
+	$sum_ins_q->execute($sage_array[0], $sage_array[1]);
+
+      # Start at -2 so we can skip the first two values (tagID, sequence)
+      my $count = -2;
+
+      # iterate through the remaining libraries
+      foreach my $lib (@sage_array)
+      {
+        if($count >= 0)
+        {
+          $insert_resulth->execute( $sage_array[0], $library_names[$count], $lib);
+		my $sum_update_q = $dbh->prepare("update sage_results_summary set $library_names[$count] = ? where tagid = ?");
+		$sum_update_q->execute($lib, $sage_array[0]);
+	}
+        $count++;
+      }
+    }
+
+  }
+
+        #print "End: Parsing Sage Input File\n";
+
+}
+
+
+#################################
+#
+# Map Sage to DB_Mummer (file: temp/$organsim.sage.fasta)
+#
+#################################
+if($run_options{'map_sage_to_db_mummer'})
+{
+
+
+        # Delete old tagmap
+        $dbh->prepare('delete from tagmap')->execute();
+
+	# First create a temporary fasta file to be used with mummer
+	my $temp_sage_fasta = "$temp_dir/$organism.sage.fasta";
+
+	open(SAGEFASTA, ">", $temp_sage_fasta);
+
+        my $get_tag_query = "select tagid, sequence from sage_tags order by tagid";
+        my $sth = $dbh->prepare($get_tag_query);
+        $sth->execute;
+
+	while(my $this_row = $sth->fetchrow_hashref)
+	{
+		print SAGEFASTA ">" . $this_row->{tagid} . "\n" . $this_row->{sequence} . "\n";
+
+	}
+	close(SAGEFASTA);
+	# Create the assembly file
+	my $tmp_assembly = create_assembly_fasta("$temp_dir/$organism.assembly.fasta");
+
+	# Now run mummer
+	system($mummer_bin . " -maxmatch -n -l $tagsize -b -c -F  $temp_sage_fasta $tmp_assembly > $temp_dir/$organism.mummer.out");
+
+	# Now parse the output
+
+	my $dir = "+";
+	my $contig = "";
+
+	open(MUMMEROUT, "$temp_dir/$organism.mummer.out");
+
+	my $insert_query = "insert into tagmap
+				(tagID, contig, start, stop, direction
+				) VALUES ( ?, ?, ?, ?, ?)";
+                               my $insert_ref = $dbh->prepare($insert_query);
+
+	while(<MUMMEROUT>)
+	{
+		my $line = $_;
+		if($line =~ /^>/) # This is a header line for a new contig
+		{
+			($contig) = $line =~ /^> ([\w\.]+)/;
+			if($line =~ /Reverse$/)
+			{
+				$dir = "-";
+			} else
+			{
+				$dir = "+";
+			}
+		} else # This is a match result line
+		{
+			my $stop = '';
+			my (undef, $tagid, undef, $start, $size) = split(/\s+/, $line);
+			if($dir eq "-")
+			{
+				$stop = $start;
+				$start = $stop - $size;
+			} else
+			{
+				$stop = $start + $size;
+			}
+			$insert_ref->execute($tagid, $contig, $start, $stop, $dir);
+
+		}
+	}
+
+	# Now mark those that pass the one rule in the summary table
+
+	my $sum_update_q = $dbh->prepare("update sage_results_summary set one_rule = 'Y' where tagid = ?");
+	my $sth = $dbh->prepare("select distinct sr.tagid from sage_results sr LEFT OUTER JOIN tagmap tm on sr.tagid = tm.tagid where ( tm.contig is not null OR sr.result >= 2)");
+
+	$sth->execute();
+	while(my $row = $sth->fetchrow_hashref)
+	{
+		$sum_update_q->execute($row->{tagid});
+	}
+	
+	system("rm -f $temp_sage_fasta");
+	system("rm -f $tmp_assembly");
+	system("rm -f $temp_dir/$organism.mummer.out");
+
+}
+
+#################################
+#
+# Map Sage Tags to Genome
+#
+#################################
+if($run_options{'map_sage_to_db_polya'})
+{
+
+
+        #print "Start: Mapping Sage Tags to Genome\n";
+
+	# Iterate through all old sage tags
+
+	my $insert_ref = $dbh->prepare("insert into tagmap (tagID, contig, start, stop, direction, assignment) VALUES (?, ?, ?, ?, ?, ?)");
+
+	my $min_size = 12;
+	my $string_size = $tagsize;
+	my $num_a = 1;
+
+	while($string_size > $min_size)
+	{
+		my $polya;
+		for(1..$num_a)
+		{
+			$polya .= 'A';
+		}
+		$string_size = $tagsize - $num_a;
+		
+		my $query_polya = "select tagid, substring(sequence, 1, $string_size) as sequence from sage_tags where tagid not in (select distinct tagid from tagmap) AND sequence like '\%$polya' order by tagid";
+		print $query_polya . "\n";
+		my $sth = $dbh->prepare($query_polya);
+		$sth->execute;
+
+		while(my $this_row = $sth->fetchrow_hashref)
+		{
+		        if($debug)
+		        {
+		                print "Checking:\t" . $this_row->{tagid} . "\n";
+		        }
+
+		        # now iterate through all sequences and check if this sequence is in one of the contigs
+
+		        my $sequences = Bio::SeqIO->new('-file'         => "<$fasta_bases_file",
+		                                        '-format'       => "fasta");
+
+		        # Create a sequence object for the query string
+		        my $sequence_string_db = $this_row->{sequence};
+
+		        $sequence_string_db =~ s/[^ATGC]//ig;
+
+		        my $this_tag_sequence = Bio::Seq->new ( -display_id     => $this_row->{tagid},
+	                                                -seq            => $sequence_string_db);
+		        my $sequence_to_check = lc($this_tag_sequence->seq);
+		        my $sequence_to_check_rc = lc($this_tag_sequence->revcom()->seq);
+
+		        my @hit_array;
+		        while (my $seq = $sequences->next_seq)
+		        {
+		                my $last_index = 0;
+		                my $this_index = -1;
+		                my $num_hits = 0;
+	
+		                if($debug)
+		                {
+#		                        print "\t" . $seq->display_id . "\n";
+		                }
+		                my $checked_first = 0;
+		                my $dir = "+";
+		                # check both this sequence and its reverse complement;
+		                while($checked_first < 2)
+		                {
+		                        $last_index = 0;
+		                        $this_index = -1;
+		                        if($checked_first == 0)
+		                        {
+		                                $this_index = index(lc($seq->seq), $sequence_to_check);
+		                                $dir = "+";
+		                        } else
+		                        {
+		                                $this_index = index(lc($seq->seq), $sequence_to_check_rc);
+		                                $dir = "-";
+		                        }
+	
+		                        # while we have a hit
+		                        while($this_index > -1)
+		                        {
+		                                $num_hits++;
+	
+						my $start = $this_index + 1;
+						my $stop = (length($this_tag_sequence->seq) + $this_index + 1) + $num_a ;
+						if($dir eq "-")
+						{
+							$start = $this_index - $num_a + 1;
+							$stop = $this_index + 1 + (length($this_tag_sequence->seq));
+						}
+		                                print   join("\t", "TAG ", $this_row->{tagid}, " matches " , $seq->display_id, " location:", $start, $stop, $dir) . "\n";
+
+		                                push @hit_array, [$this_row->{tagid}, $seq->display_id, $start, $stop, $dir];
+		                                $last_index = $this_index;
+		                                if($checked_first == 0)
+		                                {
+		                                        $this_index = index(lc($seq->seq), $sequence_to_check, $last_index+1);
+		                                } else
+		                                {
+		                                        $this_index = index(lc($seq->seq), $sequence_to_check_rc, $last_index+1);
+	
+		                                }
+		                        } # End while this db row sequence has checked a particular contig
+		                        $checked_first++;
+		                } # End while this db row sequence reversed has checked a particular contig
+		        } # End checking db row sequence to all contigs
+	
+		        # Now process the @hit_array
+		        if((scalar @hit_array) == 0)
+		        {
+		                # Tag not found, so give a message
+
+		                if($debug)
+		                {
+		                  print "TAG\t" . $this_row->{tagid} . "\t Not found!\n";
+		                }
+		        } else
+		        {
+		                # We must now map it to each location
+
+		               foreach my $this_hit(@hit_array)
+		               {
+		                       $insert_ref->execute($this_row->{tagid}, $this_hit->[1], $this_hit->[2], $this_hit->[3], $this_hit->[4], 'polya');
+		               } # end foreach tag hit
+		       	} # end else hit array == 0
+
+
+		} # end checking all db rows
+
+	$num_a++;
+	} # END while polya
+
+        #print "End: Mapping Sage Tags to Genome\n";
+
+}
+
+
+
+#################################
+#
+# Map Sage to ORF - secondary 
+#
+#################################
+if($run_options{'map_sage_to_orf_secondary'})
+{
+	# Delete the sage_temp table
+	$dbh->prepare("delete from sage_temp")->execute();
+
+	# Grab only those that map to the genome at leat once
+	my $query = "select distinct tagid from tagmap where contig is not null order by tagid";
+	my $sth = $dbh->prepare($query);
+	$sth->execute;
+
+	my $taginh =  $dbh->prepare("select distinct tagid, contig, start, stop, direction, assignment, id from tagmap where contig is not null AND tagid = ?");
+	my $tag_insh = $dbh->prepare("insert into sage_temp (tagid, start, direction, orfid, orf_direction, tagmapid, tagtype) VALUES ( ?, ?, ?, ?, ?, ?, ?)");
+	my $orfh = $dbh->prepare("select distinct orfid, start, stop, contig, direction from orfs
+                                                WHERE
+                                                    delete_fg = 'N'
+                                                AND contig = ?
+                                                AND start- ? <= ?
+                                                AND stop+ ? >= ?");
+	my $contigh = $dbh->prepare("select contig_number, bases from contigs where contig_number = ?");
+
+
+	while(my $tag_outer = $sth->fetchrow_hashref)
+	{
+		# Now check if this tag is unique or if it maps to multiple places
+		my $unique_genome = 0;
+		my $unique_transcript = 0;
+		my $primary = 0;
+
+		my $num_query = "select count(*) as num_map from tagmap where tagid = '" . $tag_outer->{tagid} . "'";
+		my $numh = $dbh->prepare($num_query);
+		$numh->execute();
+		my $num_map = $numh->fetchrow_hashref->{num_map};
+
+
+		# If it maps to only one location, then we set it as unique in transcript and unique in genome
+		if($num_map == 1)
+		{
+			$unique_genome = 1;
+			$unique_transcript = 1;
+		}
+
+		# iterate through all of the tags that this maps to
+
+		$taginh->execute($tag_outer->{tagid});
+
+		while(my $tag = $taginh->fetchrow_hashref)
+		{
+			# Now get all orf transripts that are overlapping this sage tag (either direction)
+
+
+			$orfh->execute($tag->{contig}, $transcript_tail, $tag->{start}, $transcript_tail, $tag->{stop});
+			while(my $orf_hit = $orfh->fetchrow_hashref)
+			{
+				# Now check if it is at the primary NlaIII site
+				my $transcript = '';
+				my $prim_nlasite = 0;
+				my $prim_rev_nlasite = 0;
+
+				# Create an array of arrays for each orf hit
+				#  orfid,start,stop,TranscriptSequence, PrimaryNlaIII site, PrimaryReverseNlaIII site
+				my @orf_array;
+				my $found_contig = 0;
+				# Find the contig we are interested in
+				$contigh->execute($tag->{contig});
+				my $contig_sequence = $contigh->fetchrow_hashref->{bases};
+				my $seq = Bio::Seq->new( -id=>$tag->{contig}, -seq=>$contig_sequence);
+
+				# Grab start -> stop+$transcript_tail
+				if($orf_hit->{direction} eq '+')
+				{
+				        my $stop = $orf_hit->{stop};
+					my $start = $orf_hit->{start};
+					my $offset = 0;
+				        if($orf_hit->{stop}+$transcript_tail > $seq->length())
+					{
+					  $stop = $seq->length();
+					} else
+					{
+					  $stop = $orf_hit->{stop} + $transcript_tail;
+					}
+
+					if($tag->{direction} ne $orf_hit->{direction})
+					{
+					    $offset = 3;
+					}
+					if($stop > $seq->length())
+					{
+						$stop = $seq->length();
+					}
+					if($start > $seq->length())
+					{
+						$start = $seq->length();
+					}
+					$transcript = $seq->trunc($start,$stop);
+					$prim_nlasite = rindex($transcript->seq(), 'CATG');
+					if($prim_nlasite == -1)
+					{
+						print "ORF\t" . $orf_hit->{orfid} . "\t No Primary Sense NlaIII site\n";
+					} else
+					{
+						$prim_nlasite = $prim_nlasite + $orf_hit->{start} + $offset;
+					}
+
+					# Now find the primary reverse nla3 site, but first get the hypot reverse transcript
+					# which is the start of the orf -$transcript_tail -> stop
+					if( ($orf_hit->{start} - $transcript_tail) < 1)
+					{
+					    $start = 1;
+					}else
+					{
+					    $start = $orf_hit->{start} - $transcript_tail;
+					}
+					if($orf_hit->{stop} > $seq->length)
+					{
+					    $stop = $seq->length();
+					} else
+					{
+						$stop = $orf_hit->{stop};
+					}
+
+					$transcript = $seq->trunc($start, $stop);
+                                        $prim_rev_nlasite = index($transcript->seq(), 'CATG');
+					if($prim_rev_nlasite == -1)
+                                        {
+       		                                print "ORF\t" . $orf_hit->{orfid} . "\t No Primary AntiSense NlaIII site\n";
+                                        } else
+                                        {
+                                                $prim_rev_nlasite = $prim_rev_nlasite + $start + $offset;
+                                        }
+
+
+
+				} else # Grab start-$transcript_tail -> stop
+				{
+
+				        my $start = 0;
+					my $stop = 0;
+					my $offset = 0;
+				        if($orf_hit->{start}- $transcript_tail <= 1)
+					{
+					  $start = 1;
+					} else
+					{
+					  $start = $orf_hit->{start} - $transcript_tail;
+					}
+					if($orf_hit->{stop} > $seq->length())
+					{
+						$stop = $seq->length();
+					} else
+					{
+						$stop = $orf_hit->{stop};
+					}
+					$transcript = $seq->trunc($start, $stop);
+					$prim_nlasite = index($transcript->seq(), 'CATG') ;
+					if($tag->{direction} eq $orf_hit->{direction})
+					{
+					    $offset = 3;
+					}
+                                        if($prim_nlasite == -1)
+                                        {
+                                            print "ORF\t" . $orf_hit->{orfid} . "\t No Primary Sense NlaIII site\n";
+                                        } else
+                                        {
+                                            $prim_nlasite = $prim_nlasite + $start + $offset;
+                                        }
+					$start = $orf_hit->{start};
+					if( ($orf_hit->{stop} + $transcript_tail) > $seq->length() )
+					{
+					    $stop = $seq->length();
+					}else
+					{
+					    $stop = $orf_hit->{stop} + $transcript_tail;
+					}
+					if($stop > $seq->length)
+					{
+						$stop = $seq->length();
+					}
+					if($start > $seq->length())
+					{
+						$start = $seq->length();
+					}
+					$transcript = $seq->trunc($start, $stop);
+                                        $prim_rev_nlasite = rindex($transcript->seq(), 'CATG');
+                                        if($prim_rev_nlasite == -1)
+                                        {
+                                             print "ORF\t" . $orf_hit->{orfid} . "\t No Primary Antisense NlaIII site\n";
+                                        } else
+                                        {
+                                              $prim_rev_nlasite = $prim_rev_nlasite + $start + $offset;
+                                        }
+				} # End else
+
+				my $tagstart = 0;
+				if($tag->{direction} eq "-")
+				{
+				  $tagstart = $tag->{stop};
+				} else
+				{
+				  $tagstart = $tag->{start};
+				}
+				my $code = '';
+				if( ($orf_hit->{direction} eq $tag->{direction}) && ($tagstart == $prim_nlasite) )
+				{
+				  $code = 'Primary Sense Tag';
+				} elsif( ($orf_hit->{direction} ne $tag->{direction}) && ($tagstart == $prim_rev_nlasite) )
+                                {
+				    $code = 'Primary Antisense Tag';
+                                } elsif( $orf_hit->{direction} eq $tag->{direction} )
+				{
+				    $code = 'Alternate Sense Tag';
+				} else
+				{
+				    $code = 'Alternate Antisense Tag';
+				}
+
+
+				print "TAG\t" . $tag->{tagid} . "\t" . $tagstart . "\t" . $tag->{direction} . "\tORF\t" . $orf_hit->{orfid} . "\t" . $orf_hit->{direction} . "\t" . $prim_nlasite . "\t" . $prim_rev_nlasite . "\t" . $code . "\t" ;
+				$tag_insh->execute($tag->{tagid}, $tagstart, $tag->{direction}, $orf_hit->{orfid}, $orf_hit->{direction}, $tag->{id}, $code);
+
+				if($unique_genome)
+				{
+				    print "UG\t";
+				} else
+				{
+				    print "NG\t";
+				}
+
+				if($unique_transcript)
+				{
+				    print "UT\t";
+				}else
+				{
+				    print "NT\t";
+				}
+				print "\n";
+
+			} # end while I am done with all orfs that overlap this sagetag
+
+		} # end if this tag maps to only one part of the genome
+
+	} # end iterate through all tags
+}
+
+#################################
+#
+# Map Sage to ORF - tertiary 
+#
+#################################
+if($run_options{'map_sage_to_orf_tert'})
+{
+
+	# Delete the orftosage table;
+	my @params = ('ktuple' => 2, 'matrix' => 'BLOSUM', 'OUTPUT'=>'GCG');
+	my $factory = Bio::Tools::Run::Alignment::Clustalw->new(@params);
+	$factory->quiet(1);
+	my $aln_min = 95;
+
+	$dbh->prepare('delete from orftosage')->execute();
+
+	# Now iterate through all tags again
+	# Check how many orf hits a tag has,
+		#if it has only one, mark it, otherwise we need to make a decision
+		# if it has more then one, and only one of them is a primary NlaIII site, mark that orf as the correct orf
+		# If none lie on a primary NlaIII site and only one is on an alternate forward site, mark that 
+		# If all are on alternate reverse sites, and only one is on a primary alternate, mark that     -- NOT DONE
+
+	my $tagh = $dbh->prepare("select distinct tagid from tagmap where tagid");
+	$tagh->execute();
+	my $continue = 1;
+        my $insh = $dbh->prepare("insert into orftosage (orfid, tagid, tagtype, tagmapid, unique_genome_fg, unique_trans_fg) VALUES (?, ?, ?, ?, ?, ?)");
+	while(my $tags = $tagh->fetchrow_hashref)
+	{
+		$continue = 1;
+		my $tagmaph = $dbh->prepare("select tagid, start, direction, orfid, orf_direction, tagtype, tagmapid from sage_temp where tagid = ?");
+		$tagmaph->execute($tags->{tagid});
+
+		# check if this tag is unique to the genome
+		my $unique_genome = 0;
+
+		my $ugh = $dbh->prepare("select count(*) as num_tag from tagmap where tagid = ?");
+		$ugh->execute($tags->{tagid});
+		my $ugnum = $ugh->fetchrow_hashref;
+		if($ugnum->{num_tag} == 1)
+		{
+			$unique_genome = 1;
+		}
+
+
+		# If we only map to one place and one orf, this will only return one record
+		if($tagmaph->rows == 0)
+		{
+			# Do nothing
+		} elsif($tagmaph->rows == 1)
+		{
+			# Now get the record and update
+			my $this_row = $tagmaph->fetchrow_hashref;
+			$insh->execute($this_row->{orfid}, $this_row->{tagid}, $this_row->{tagtype}, $this_row->{tagmapid}, $unique_genome, 1);
+
+		} else
+		{
+			# Check if only one of these is a primary sense tag
+			my $checkh = $dbh->prepare("select orfid, tagmapid from sage_temp where tagid = ? AND tagtype = 'Primary Sense Tag'");
+			$checkh->execute($tags->{tagid});
+			if($checkh->rows == 0)
+			{
+				# This is not a primary sense tag for any orf
+				# Now check if it is a Alternate Sense tag for only one
+				my $checkalth = $dbh->prepare("select orfid, tagmapid from sage_temp where tagid = ? AND tagtype = 'Alternate Sense Tag'");
+				$checkalth->execute($tags->{tagid});
+				if($checkalth->rows == 1)
+				{
+					my $this_row = $checkalth->fetchrow_hashref;
+					$insh->execute($this_row->{orfid}, $tags->{tagid}, 'Alternate Sense Tag', $this_row->{tagmapid}, 0, 0);
+				} elsif($checkalth->rows > 1)
+				{
+					# It is Alternate for Multiple, so check if those multiples are the same, also need to check when a tag hits 2 times on the same orf
+					my $orfs_array;
+					my $orfs_hash;
+					my $temp_orfs;
+					while(my $row = $checkalth->fetchrow_hashref)
+					{
+						my $hash;
+						$hash->{orfid} = $row->{orfid};
+						$hash->{tagid} = $tags->{tagid};
+						$hash->{tagmapid} = $row->{tagmapid};
+						push(@{$temp_orfs}, $hash);
+						$orfs_hash->{$row->{orfid}} = $mbl->get_orf_nt_sequence($row->{orfid}, "Y", "Y");
+					}
+					while(my ($key, $val) = each %{$orfs_hash})
+					{
+						push(@{$orfs_array}, $val);
+					}
+					if(scalar @{$orfs_array} > 1)
+					{
+						my $aln = $factory->align($orfs_array);
+						# If the alignment is successful
+						if($aln)
+						{
+							print $tags->{tagid} . " has multiple alternates with identity of " . $aln->percentage_identity . "\n";
+							if($aln->percentage_identity > $aln_min)
+							{
+								foreach my $orfrow (@{$temp_orfs})
+								{
+									$insh->execute($orfrow->{orfid}, $tags->{tagid}, 'Alternate Sense Tag', $orfrow->{tagmapid}, 0, 0);
+								}
+								$continue = 0;
+							} else
+							{
+								$continue = 1;
+							}
+						} else
+						{
+								$continue = 1;
+						}
+					} else
+					{
+						# this tag only hits on one orf multiple times
+						foreach my $orfrow (@{$temp_orfs})
+						{
+							$insh->execute($orfrow->{orfid}, $tags->{tagid}, 'Alternate Sense Tag', $orfrow->{tagmapid}, 0, 0);
+						}
+					}
+				} else
+				{
+				}
+				$continue = 1;
+			} elsif($checkh->rows > 1)
+			{
+				# We can not make any observations on this due to it maping to multiple primaries
+
+				# Check if all of the orfs are identical
+				my $orfs_array;
+				my $orfs_hash;
+				my $temp_orfs;
+				while(my $row = $checkh->fetchrow_hashref)
+				{
+					my $hash;
+					$hash->{orfid} = $row->{orfid};
+					$hash->{tagid} = $tags->{tagid};
+					$hash->{tagmapid} = $row->{tagmapid};
+					push(@{$temp_orfs}, $hash);
+					$orfs_hash->{$row->{orfid}} = $mbl->get_orf_nt_sequence($row->{orfid}, "Y", "Y");
+				}
+				while(my ($key, $val) = each %{$orfs_hash})
+				{
+					push(@{$orfs_array}, $val);
+				}
+				if(scalar @{$orfs_array} > 1)
+				{
+					my $aln = $factory->align($orfs_array);
+					if($aln)
+					{
+						print $tags->{tagid} . " has multiple primaries with identity of " . $aln->percentage_identity . "\n";
+						if($aln->percentage_identity > $aln_min)
+						{
+							foreach my $orfrow (@{$temp_orfs})
+							{
+								$insh->execute($orfrow->{orfid}, $tags->{tagid}, 'Primary Sense Tag', $orfrow->{tagmapid}, 0, 0);
+							}
+							$continue = 0;
+						} else
+						{
+							$continue = 1;
+						}
+					} else
+					{
+						$continue = 1;
+					}
+				} else
+				{
+					# this tag only hits on one orf multiple times
+					foreach my $orfrow (@{$temp_orfs})
+					{
+						$insh->execute($orfrow->{orfid}, $tags->{tagid}, 'Primary Sense Tag', $orfrow->{tagmapid}, 0, 0);
+					}
+				}
+			} elsif($checkh->rows == 1)
+			{
+				my $this_row = $checkh->fetchrow_hashref;
+				$insh->execute($this_row->{orfid}, $tags->{tagid}, 'Primary Sense Tag', $this_row->{tagmapid}, 0, 0);
+				$continue = 0;
+			}
+
+		} # END ELSE THIS IS IN ZERO OR ONE TIMES ONLY
+	} # END WHILE ITERATING THROUGH TAGS
+
+
+}
+
+#################################
+#
+# Calculate Sage Totals 
+#
+#################################
+if($run_options{'calculate_sage_totals'})
+{
+	my $totalfilteredh = $dbh->prepare("SELECT library, sum(result) as total
+FROM sage_results,
+(
+  SELECT distinct sr.tagid
+  FROM sage_results sr
+    LEFT OUTER JOIN tagmap tm on sr.tagid = tm.tagid
+    WHERE ( tm.contig is not null OR sr.result >= 2)
+) filtered_results
+where filtered_results.tagid = sage_results.tagid
+group by library");
+	my $gettotalh = $dbh->prepare("select sum(result) as total_results from sage_results where library = ?");
+
+	my $update_h = $dbh->prepare("update sage_library_names set total = ?, total_filtered = ? where library = ?");
+
+	$totalfilteredh->execute();
+
+	while(my $row = $totalfilteredh->fetchrow_hashref)
+	{
+		$gettotalh->execute($row->{library});
+		my $total = $gettotalh->fetchrow_hashref->{total_results};
+		$update_h->execute($total, $row->{total}, $row->{library});
+	}
+        my $sum_update_q = $dbh->prepare("update sage_results_summary set one_rule = 'Y' where tagid = ?");
+        my $sth = $dbh->prepare("select distinct sr.tagid from sage_results sr LEFT OUTER JOIN tagmap tm on sr.tagid = tm.tagid where ( tm.contig is not null OR sr.result >= 2)");
+                                                                                                                                                                                                                                                      
+        $sth->execute();
+        while(my $row = $sth->fetchrow_hashref)
+        {
+                $sum_update_q->execute($row->{tagid});
+        }
+                                                                                                                                                                                                                                                      
+
+}
+
+
+
+#################################
+#
+# Find Repeats (file: assembly.bases)
+#
+#################################
+if($run_options{'find_repeat'})
+{
+	#print "Begin finding repeat regions... \n";
+	# Run the repeat finder program
+	# Create the assembly file
+	my $tmp_assembly_file = "$temp_dir/$organism.assembly.fasta";
+	create_assembly_fasta($tmp_assembly_file);
+	system($repeatFinder_bin . ' -in ' . $tmp_assembly_file . ' -out ' . $temp_dir . '/' . $organism . '.repeat ' . $organism);
+
+	# Parse the file and place into database
+	if (! -f $temp_dir . '/' . $organism . '.repeat') 
+	{
+		warn "Unable to locate organism.repeat";
+	} else 
+	{
+		open(REPEAT, $temp_dir . '/' . $organism . '.repeat') or die ("Can not open $organism.repeat");;
+		open(REPEATSUPEROUT, ">", $gff_supercontig_repeat_file );
+		open(REPEATOUT, ">", $gff_repeat_file );
+	
+		while(<REPEAT>)
+		{
+			my $line = $_;
+			if(substr($line, 0, 1) eq '#')
+			{
+				# Do nothing
+			} else
+			{
+				chomp($line);
+				my ($contig, $rep_name, $start, $stop, $class) = split("\t", $line);
+				my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($contig, $start, $stop);
+	
+				print REPEATSUPEROUT  join("\t", "supercontig_" . $super_id, 
+						'ClosureRepeatFinder-3.7', 
+						'repeat_region', 
+						$sc_start, 
+						$sc_stop, 
+						'.', 
+						'.', 
+						'.', 
+						"Sequence $rep_name") 	. "\n";
+	
+				print REPEATOUT join("\t", $contig, 
+						'ClosureRepeatFinder-3.7', 
+						'repeat_region', 
+						$start, 
+						$stop, 
+						'.', 
+						'.', 
+						'.', 
+						"Sequence $rep_name")	. "\n";
+			}
+		}
+	}
+		#print "Finished finding repeat regions.\n";
+
+}
+
+#################################
+#
+# Find tRNA (file: temp/$organism.trna)
+#
+#################################
+if($run_options{'find_trna'})
+{
+	#print "Start: Find tRNA temp/$organism.trna\n";
+	my $trna_flags = '';
+	if($is_bacterial)
+	{
+		$trna_flags = ' -B';
+	}
+	my $trna_temp_file = $temp_dir . "/$organism.trna";
+	my $tmp_assembly = create_assembly_fasta("$temp_dir/$organism.assembly.fasta");
+	system("rm -f $trna_temp_file");
+	system($trnascan_bin . $trna_flags . " -o $trna_temp_file $tmp_assembly");
+	open(TRNAFILE, "$temp_dir/" . $organism . '.trna');
+	open(TRNAGFF, ">", $gff_trna_file);
+    open(TRNASUPER, ">", $gff_supercontig_trna_file);
+	my $count = 1;
+	while(<TRNAFILE>)
+	{
+		# Skip the first 3 lines
+		if($count >= 4)
+		{
+			my $line = $_;
+			chomp($line);
+			my ($contig, $ordinal, $start, $stop, $type, $anti_codon, $intron_start, $intron_end, $score) = split("\t", $line);
+			my $dir = '';
+
+			if($start > $stop)
+			{
+				$dir = '-';
+			} else
+			{
+				$dir = '+';
+			}
+
+			my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($contig, $start, $stop);
+                        print TRNASUPER      join("\t", "supercontig_" . $super_id, 'tRNAscan-SE-1.23', 'tRNA', $sc_start, $sc_stop ,$score,$dir ,'0',"tRNA $type ; anticodon $anti_codon ; Contig $contig ;" ) . "\n";
+                        print TRNAGFF   join("\t", $contig, 'tRNAscan-SE-1.23', 'tRNA', $start, $stop ,$score,$dir ,'0',"tRNA $type ; anticodon $anti_codon" ) . "\n";
+
+		}
+		$count++;
+	}
+	#print "End: Find tRNA temp/$organism.trna\n";
+
+}
+
+#################################
+#
+# Calculate coverage (files: coverage.gff, supercontig_coverage.gff)
+#
+#################################
+if($run_options{'calculate_coverage'})
+{
+
+	#print "Start: Calculate coverage coverage.gff, supercontig_coverage.gff\n";
+	open(COVER, ">", $gff_coverage_file);
+	open(SUPERCOVER, ">", $gff_supercontig_coverage_file);
+
+        my $contigh = $dbh->prepare("select contig_number, contig_length, super_id,
+                                    contig_start_super_base, modified_contig_start_base from links order by contig_number");
+        $contigh->execute();
+        while(my $contighash = $contigh->fetchrow_hashref)
+        {
+                #  use an array to determine what parts of the contig are covered
+                # initialize the array
+		my @coverage_array;
+                for(1..$contighash->{contig_length})
+                {
+                        $coverage_array[$_] = 0;
+                }
+                my $readh = $dbh->prepare("select trim_read_in_contig_start, 
+						trim_read_in_contig_stop 
+					  from reads_assembly where contig_number = ?");
+		$readh->execute($contighash->{contig_number});
+                while(my $readhash = $readh->fetchrow_hashref)
+                {
+                        for($readhash->{trim_read_in_contig_start}..$readhash->{trim_read_in_contig_stop})
+                        {
+                                $coverage_array[$_]++;
+                        }
+                }
+                # Now find all streches of equal length and output them to the gff file
+
+                my $temp_start = 0;
+                my $temp_stop = 0;
+		my $last_val = 0;
+                for(1..$contighash->{contig_length})
+                {
+			if($_ == 1)
+			{
+				$temp_start = 1;
+				$temp_stop = 1;
+			} elsif( ($coverage_array[$_-1] == $coverage_array[$_]) && ($_ != $contighash->{contig_length}) )
+			{
+				$temp_stop = $_;
+			} else
+			{
+				# If this is the last one, set the stop as now
+				if($_ == $contighash->{contig_length})
+				{
+					$temp_stop = $_;	
+				}
+
+				my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($contighash->{contig_number}, $temp_start, $temp_stop);
+				# We have a different coverage number, so print to the gff file
+				print COVER join("\t", 'contig_' .  $contighash->{contig_number} , 'count', 'coverage', $temp_start, $temp_stop, $coverage_array[$_-1], '.', '.', 'coverage read_coverage') . "\n";
+                                print SUPERCOVER join("\t", 'supercontig_' .  $super_id, 'count', 'coverage', $sc_start, $sc_stop, $coverage_array[$_-1], '.', '.', 'coverage read_coverage') . "\n";
+				$temp_start = $_;
+				$temp_stop = $_;
+                        }
+                }
+        }
+	#print "End: Calculate coverage coverage.gff, supercontig_coverage.gff\n";
+}
+
+#################################
+#
+# Create Quality gff (files: quality.gff, supercontig_quality.gff)
+#
+#################################
+if($run_options{'create_quality_gff'})
+{
+	#print "Start: Create quality gff: quality.gff, supercontig_quality.gff\n";
+	open(QUAL, ">", $gff_quality_file);
+	open(SUPERQUAL, ">", $gff_supercontig_quality_file);
+
+	my $sth = $dbh->prepare("select contig_number, quality from contig_quality");
+	$sth->execute();
+	while(my $row = $sth->fetchrow_hashref)
+	{
+		my (@qual) = $row->{quality} =~ /(\d+)/g;
+		my $temp_start = 0;
+		my $temp_stop = 0;
+		my $last_val = 0;
+		my $len = scalar @qual;
+
+		# Add one to the front of the array to make the numbers easier
+		unshift(@qual, 0);
+
+		for(1..$len)
+		{
+			if($_ == 1)
+			{
+				$temp_start = 1;
+				$temp_stop = 1;
+			} elsif( ($qual[$_-1] == $qual[$_]) && ($_ != $len) )
+			{
+				$temp_stop = $_;
+			} else
+			{
+				# If this is the last one, set the stop as now
+				if($_ == $len)
+				{
+					$temp_stop = $_;	
+				}
+
+				my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($row->{contig_number}, $temp_start, $temp_stop);
+				# We have a different coverage number, so print to the gff file
+				print QUAL join("\t", 'contig_' .  $row->{contig_number} , 'count', 'quality', $temp_start, $temp_stop, $qual[$_-1], '.', '.', 'quality base_quality') . "\n";
+                                print SUPERQUAL join("\t", 'supercontig_' .  $super_id, 'count', 'quality', $sc_start, $sc_stop, $qual[$_-1], '.', '.', 'quality base_quality') . "\n";
+				$temp_start = $_;
+				$temp_stop = $_;
+                        }
+
+		}
+
+	}
+	
+	#print "End: Create quality gff: quality.gff, supercontig_quality.gff\n";
+
+}
+
+
+
+#################################
+#
+# Calculate NUCMER Matches (files: matches.gff, supercontig_matches.gff)
+#
+#################################
+if($run_options{'calculate_matches_nucmer'})
+{
+	#print "Start: Calculate NUCMER Matches: matches.gff, supercontig_matches.gff\n";
+	my $tmp_assembly = create_assembly_fasta("$temp_dir/$organism.assembly.fasta");
+	system("$nucmer_bin -o -maxmatch -c 20 -l 20 -noextend -p $temp_dir/$organism $tmp_assembly $tmp_assembly");
+
+	open(COORD, "$temp_dir/$organism" . ".coords") || warn "Unable to open $temp_dir/$organism" . ".coords file\n";
+	open(MATCHES, ">$gff_matches") || warn "Unable to open contig matches file: $gff_matches.\n";
+	open(SUPERMATCHES, ">$gff_supercontig_matches") || warn "Unable to open supercontig matches file: $gff_supercontig_matches.\n";
+	
+
+	# Create an hash of arrays one array for each contig with it's coverage value at each base
+	my %contig_arrays;
+        my $contigh = $dbh->prepare("select contig_number, contig_length, super_id,
+                                    contig_start_super_base, modified_contig_start_base from links order by contig_number");
+        $contigh->execute();
+        while(my $contighash = $contigh->fetchrow_hashref)
+        {
+                # initialize the array
+                my $contig;
+                for(1..$contighash->{contig_length})
+                {
+                        $contig->[$_] = 0;
+                }
+		$contig_arrays{$contighash->{contig_number}} = $contig;
+	}
+	
+	while(<COORD>)
+	{
+		if (/^\s+\d+/) {
+		my $line = $_;
+		my ($ref_start, $ref_end, $query_start, $query_end, $ref_len, $query_len, $identity, $ref_name, $query_name) = $line =~ /^\s+(\d+)\s+(\d+)\s+\|\s+(\d+)\s+(\d+)\s+\|\s+(\d+)\s+(\d+)\s+\|\s+(\d+\.\d+)\s+\|\s+(\w+)\s+(\w+)/;
+		my ($ref_number) = $ref_name =~ /(\d+)/;
+		my ($query_number) = $query_name =~ /(\d+)/;
+
+		# Print all internal matches except ones where we match ourselves
+		if(($ref_number ne $query_number) && ($query_start ne $ref_start) && ($query_end ne $ref_end))
+			{
+				my $temp_r_start = $ref_start;
+				my $temp_r_end = $ref_end;
+				my $r_dir = "+";
+				my $temp_q_start = $query_start;
+				my $temp_q_end = $query_end;
+				my $q_dir = "+";
+				if($ref_start > $ref_end)
+                        	{
+					my $tmp;
+					$tmp = $temp_r_start;
+					$temp_r_start = $temp_r_end;
+					$temp_r_end = $tmp;
+					$r_dir = "-";
+                        	}
+				if($query_start > $query_end)
+				{
+					my $tmp;
+					$tmp = $temp_q_start;
+					$temp_q_start = $temp_q_end;
+					$temp_q_end = $tmp;
+					$q_dir = "-";
+				}
+				my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($ref_number, $temp_r_start, $temp_r_end);		
+	
+				my $name_string = 'match contig_' . $query_number . '_' . $query_start . '-' . $query_end . " ; reference_contig $ref_number ; query_contig $query_number ; " . 
+							"query_start $temp_q_start ; query_end $temp_q_end ; reference_start $ref_start ; reference_end $ref_end ; " .
+							"reference_dir $r_dir ; query_dir $q_dir ; identity $identity ; reference_length $ref_len ; query_length $query_len ; ";
+				print MATCHES join("\t", 'contig_' .  $ref_number , 'nucmer', 'internal_match', $temp_r_start, $temp_r_end, '.', $q_dir, '.', $name_string) . "\n";
+				print SUPERMATCHES join("\t", 'supercontig_' .  $super_id , 'nucmer', 'internal_match', $sc_start, $sc_stop, '.', $q_dir, '.', $name_string) . "\n";
+			}
+			# Determine if the percent similarity is high enough to be considered a match
+			if($identity >= ($min_frac_identical*100) )
+			{
+				#print join("\t", $ref_start, $ref_end, $query_start, $query_end, $ref_len, $query_len, $identity, $ref_name, $query_name ) . "\n";
+				if($ref_start > $ref_end)
+				{
+					my $tmp = $ref_end;
+					$ref_end = $ref_start;
+					$ref_start = $tmp;
+				}
+	
+				for($ref_start..$ref_end)
+				{
+					$contig_arrays{$ref_number}->[$_]++;
+				}
+			}
+		}
+	}
+	#print "End: Calculate NUCMER Matches: matches.gff, supercontig_matches.gff\n";
+}
+
+#################################
+#
+# Previous Assembly NUCMER Matches (files: matches.gff, supercontig_matches.gff)
+#
+#################################
+if($run_options{'previous_assembly_matches_nucmer'})
+{
+	#print "Start: Previous assembly NUCMER Matches: matches.gff, supercontig_matches.gff\n";
+	my $match_file = "$run_dir/last_assembly";
+	system("$nucmer_bin -o -noextend -p temp/$organism $fasta_bases_file $match_file");
+	open(COORD, "temp/$organism" . ".coords");
+	open(MATCHES, ">$gff_matches.new");
+	open(SUPERMATCHES, ">$gff_supercontig_compare_file");
+
+	# Create an hash of arrays one array for each contig with it's coverage value at each base
+	my %contig_arrays;
+        my $contigh = $dbh->prepare("select contig_number, contig_length, super_id,
+                                    contig_start_super_base, modified_contig_start_base from links order by contig_number");
+        $contigh->execute();
+        while(my $contighash = $contigh->fetchrow_hashref)
+        {
+                # initialize the array
+                my $contig;
+                for(1..$contighash->{contig_length})
+                {
+                        $contig->[$_] = 0;
+                }
+		$contig_arrays{$contighash->{contig_number}} = $contig;
+	}
+	
+	while(<COORD>)
+	{
+		my $line = $_;
+		my ($ref_start, $ref_end, $query_start, $query_end, $ref_len, $query_len, $identity, $ref_name, $query_name) = $line =~ /^\s+(\d+)\s+(\d+)\s+\|\s+(\d+)\s+(\d+)\s+\|\s+(\d+)\s+(\d+)\s+\|\s+(\d+\.\d+)\s+\|\s+(\w+)\s+(\w+)/;
+		my ($ref_number) = $ref_name =~ /(\d+)/;
+                my ($query_number) = $query_name =~ /(\d+)/;
+
+		my $temp_r_start = $ref_start;
+		my $temp_r_end = $ref_end;
+		my $r_dir = "+";
+		my $temp_q_start = $query_start;
+		my $temp_q_end = $query_end;
+		my $q_dir = "+";
+		if($ref_start > $ref_end)
+                {
+			my $tmp;
+			$tmp = $temp_r_start;
+			$temp_r_start = $temp_r_end;
+			$temp_r_end = $tmp;
+			$r_dir = "-";
+                }
+		if($query_start > $query_end)
+		{
+			my $tmp;
+			$tmp = $temp_q_start;
+			$temp_q_start = $temp_q_end;
+			$temp_q_end = $tmp;
+			$q_dir = "-";
+		}
+		my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($ref_number, $temp_r_start, $temp_r_end);		
+
+		my $name_string = 'match contig_' . $query_number . '_' . $query_start . '-' . $query_end . " ; reference_contig $ref_number ; query_contig $query_number ; " . 
+				"query_start $temp_q_start ; query_end $temp_q_end ; reference_start $ref_start ; reference_end $ref_end ; " .
+					"reference_dir $r_dir ; query_dir $q_dir ; identity $identity ; reference_length $ref_len ; query_length $query_len ; ";
+		print MATCHES join("\t", 'contig_' .  $ref_number , 'nucmer', 'reference_match', $temp_r_start, $temp_r_end, '.', $q_dir, '.', $name_string) . "\n";
+		print SUPERMATCHES join("\t", 'supercontig_' .  $super_id , 'nucmer', 'reference_match', $sc_start, $sc_stop, '.', $q_dir, '.', $name_string) . "\n";
+		# Determine if the percent similarity is high enough to be considered a match
+		if($identity >= ($min_frac_identical*100) )
+		{
+			#print join("\t", $ref_start, $ref_end, $query_start, $query_end, $ref_len, $query_len, $identity, $ref_name, $query_name ) . "\n";
+			if($ref_start > $ref_end)
+			{
+				my $tmp = $ref_end;
+				$ref_end = $ref_start;
+				$ref_start = $tmp;
+			}
+
+			for($ref_start..$ref_end)
+			{
+				$contig_arrays{$ref_number}->[$_]++;
+			}
+		}
+		
+	}
+
+}
+
+
+#################################
+#
+# Insert Blast Annotation
+#
+#################################
+if($run_options{'insert_blast_annotation'})
+{
+	#print "Start: insert blast annotation\n";
+	# Get all valid orfs
+	my $orfsh = $dbh->prepare("select orfid from orfs where delete_fg = 'N'");
+	my $top_blasth = $dbh->prepare("select hit_name, description, evalue, accession_number from blast_results where sequence_type_id = 2 AND db IN (2, 3) AND algorithm = 3 AND idname = ? AND (description not like '%ATCC 50803%' OR description like '%gb|%') AND evalue < 1e-20 order by evalue ASC, db DESC limit 1");
+	$orfsh->execute();
+	my $insannotation_h = $dbh->prepare("INSERT INTO annotation (userid, orfid, annotation, notes, delete_fg, blessed_fg, private_fg) VALUES (?, ?, ?, ?, ?, ?, ?)");
+	my $check_annoth = $dbh->prepare("select id from annotation where orfid = ? AND blessed_fg = 'Y' AND delete_fg = 'N'");
+
+	while(my $orf_row = $orfsh->fetchrow_hashref)
+	{
+		# Get the top blast hit as an annotation
+		$top_blasth->execute($orf_row->{orfid});
+		if($top_blasth->rows > 0)
+		{
+			# Check to see if we already have an annotation for this gene
+			$check_annoth->execute($orf_row->{orfid});
+			if($check_annoth->rows > 0)
+			{
+				# Do Nothing
+			} else
+			{
+				# We have a new annotation
+				my $blast_row= $top_blasth->fetchrow_hashref;
+				$insannotation_h->execute(1, $orf_row->{orfid}, $blast_row->{description}, 'Automatic annotation from match vs top blast hit at e-value=' . $blast_row->{evalue} . ' verses accession ' . $blast_row->{accession_number}. '.', 'N', 'Y', "N");
+			}
+		
+		}
+	}
+
+	#print "Finished: insert blast annotation\n";
+}
+
+
+
+#################################
+#
+# Create Search DB (file: blastdb/$organsim)
+#
+#################################
+if($run_options{'create_search_db'})
+{
+	#print "Start: Create search $blast_db_dir/$organism\n";
+	# We need to create a fasta file first, then call the formatdb and dbifasta command on it
+
+#	system("mkdir $emboss_db_dir/$organism");
+
+	# Contigs first, this is the same as our assembly.bases
+
+	my $contigsh = $dbh->prepare("select contig_number, bases from contigs");
+	open(CONTIGFILE, ">", $blast_db_dir . '/' . $organism);
+	$contigsh->execute();
+	while(my $row = $contigsh->fetchrow_hashref)
+	{
+		print CONTIGFILE ">" . $row->{contig_number} . "\n" . uc($row->{bases} . "\n");
+	}
+
+#	system('cp ' . $fasta_bases_file . ' ' . $blast_db_dir . '/' . $organism );
+        system($blast_bin_dir . 'formatdb -t ' . $organism . ' -i ' . $blast_db_dir . '/' . $organism . ' -p F -o T');
+	
+#	system("mkdir $emboss_db_dir/$organism/contigs");
+#        system("cp $fasta_bases_file $emboss_db_dir/$organism/contigs/$organism" );
+#	system("cd $emboss_db_dir/$organism/contigs/;dbifasta -idformat simple -directory . -filenames $organism -dbname $organism_name" . "_contigs -release $release_version -date $release_date");
+
+       # Supercontigs for use with gbrowse
+        system('cp ' . $supercontig_fasta_file . ' ' . $blast_db_dir . '/' . $organism . '_supercontig' );
+        system($blast_bin_dir . 'formatdb -t ' . $organism . '_supercontig -i ' . $blast_db_dir . '/' . $organism . '_supercontig -p F -o T');
+
+	# ORFs as nt sequences
+	my $orf_nt_file = $blast_db_dir . '/' . $organism . '_orfs_nt';
+        open(ORFFILE, '>', $orf_nt_file);
+
+        my $query = "select orfid, sequence from orfs where delete_fg = 'N'";
+
+        my $sth = $dbh->prepare($query);
+        $sth->execute;
+
+        while(my $orf = $sth->fetchrow_hashref)
+        {
+                print ORFFILE ">" . $orf->{orfid} . "\n";
+                # load this sequence into a sequence object
+                my $this_sequence_obj = Bio::Seq->new( -id  => 'my_sequence',
+                                -seq =>$orf->{sequence});
+
+
+                print ORFFILE $this_sequence_obj->seq();
+                print ORFFILE "\n";
+        }
+        close ORFFILE;
+
+	system($blast_bin_dir . 'formatdb -t ' . $organism . '_orfs_nt -i ' . $blast_db_dir . '/' . $organism . '_orfs_nt -p F -o T');
+#        system("mkdir $emboss_db_dir/$organism/orfs_nt");
+#	system("cp $orf_nt_file $emboss_db_dir/$organism/orfs_nt/" );
+#        system("cd $emboss_db_dir/$organism/orfs_nt/;dbifasta -idformat simple -directory . -filenames $organism" . "_orfs_nt -dbname $organism_name" . "_orfs_nt -release $release_version -date $release_date");
+
+
+
+
+	# Translated ORFs
+	my $orf_aa_file = $blast_db_dir . '/' . $organism . '_orfs_aa';
+	open(ORFFILE, '>', $orf_aa_file);
+
+	my $query = "select orfid, sequence from orfs where delete_fg = 'N'";
+
+	my $sth = $dbh->prepare($query);
+	$sth->execute;
+
+	while(my $orf = $sth->fetchrow_hashref)
+	{
+	        print ORFFILE ">" . $orf->{orfid} . "\n";
+	        # load this sequence into a sequence object
+	        my $this_sequence_obj = Bio::Seq->new( -id  => 'my_sequence',
+	                        -seq =>$orf->{sequence});
+
+	        print ORFFILE $this_sequence_obj->translate()->seq();
+	        print ORFFILE "\n";
+	}
+	close ORFFILE;
+
+        system($blast_bin_dir . 'formatdb -t ' . $organism . '_orfs_aa -i ' . $blast_db_dir . '/' . $organism . '_orfs_aa -p T -o T');
+#        system("mkdir $emboss_db_dir/$organism/orfs_aa");
+#        system("cp $orf_aa_file $emboss_db_dir/$organism/orfs_aa/" );
+#        system("cd $emboss_db_dir/$organism/orfs_aa/;dbifasta -idformat simple -directory . -filenames $organism" . "_orfs_aa -dbname $organism_name" . "_orfs_aa -release $release_version -date $release_date");
+
+
+	# Unused Reads
+
+        open(READFILE, '>', $blast_db_dir . '/' . $organism . '_unused_reads_nt');
+
+	my $query = "select read_name as readname, upper(bases) as bases from reads_bases where read_name NOT IN (select read_name from reads_assembly)";
+        my $sth = $dbh->prepare($query);
+        $sth->execute;
+
+        while(my $read = $sth->fetchrow_hashref)
+        {
+                print READFILE ">" . $read->{readname} . "\n";
+                # load this sequence into a sequence object
+                my $this_sequence_obj = Bio::Seq->new( -id  => 'my_sequence',
+                                -seq =>$read->{bases});
+
+                print READFILE $this_sequence_obj->seq();
+                print READFILE "\n";
+        }
+        close READFILE;
+
+        system($blast_bin_dir . 'formatdb -t ' . $organism . '_unused_reads_nt -i ' . $blast_db_dir . '/' . $organism . '_unused_reads_nt -p F -o T');
+
+	#print "Finished: Create search $blast_db_dir/$organism\n";
+
+}
+
+#################################
+#
+# Create Download Files (file: $download_dir/orfs.fas, etc.)
+#
+#################################
+if($run_options{'create_download_files'})
+{
+	#print "Started: Create download files\n";
+	# Create directories
+        system('mkdir ' . $web_dir);
+        system('mkdir ' . $download_dir);
+
+	# Create fasta file for orfs, translated orfs, used shotgun reads, unused reads, contigs
+
+	#ORFs
+
+#	open(ORFFILE, ">", $download_dir . 'orfs.fas');
+	my $orfio = Bio::SeqIO->new(-file=>">$download_dir" . 'orfs.fas', -format=>'fasta', -verbose=>0);
+
+        my $query = "select orfid, upper(sequence) as sequence from orfs where delete_fg = 'N'";
+
+        my $sth = $dbh->prepare($query);
+        $sth->execute;
+
+        while(my $orf = $sth->fetchrow_hashref)
+        {
+		my $text_type = '';
+		my $text_desc = '';
+		my $annotation = $mbl->get_newest_annotation($orf->{orfid});
+		if($annotation eq 'No annotation')
+		{
+			my $blast_row = $mbl->get_top_orf_hit($orf->{orfid});
+			if($blast_row)
+			{
+				$text_type = 'blasthit ' . $blast_row->{evalue};
+				$text_desc = $blast_row->{hit_name} . $blast_row->{description};
+			} else
+			{
+				$text_type = 'Hypothetical Protein';
+			}
+		} else
+		{
+			$text_type = 'annotation';
+			$text_desc = $annotation;
+		}
+		my $orf_name = $orf->{orfid};
+		my $orf_desc =  "|$text_type|$text_desc";
+#                print ORFFILE ">" . $orf->{orfid} . "|$text_type|$text_desc" .  "\n";
+                # load this sequence into a sequence object
+                my $this_sequence_obj = Bio::Seq->new( -id  => $orf_name, -desc=>$orf_desc,
+                                -seq =>$orf->{sequence});
+
+		$orfio->write_seq($this_sequence_obj);
+#                print ORFFILE $this_sequence_obj->seq();
+#                print ORFFILE "\n";
+        }
+#        close ORFFILE;
+
+	system('gzip -f ' . $download_dir . 'orfs.fas');
+	$mbl->set_new_file("orfs", "orfs.fas.gz", "orfs", $download_dir . 'orfs.fas.gz', undef);
+
+        # Translated ORFs
+
+#        open(ORFFILE, '>', $download_dir. 'orfs_aa.fas');
+	my $orfaaio = Bio::SeqIO->new(-file=>">$download_dir" . 'orfs_aa.fas', -format=>'fasta', -verbose=>0);
+
+        my $query = "select orfid, upper(sequence) as sequence from orfs where delete_fg = 'N'";
+
+        my $sth = $dbh->prepare($query);
+        $sth->execute;
+
+        while(my $orf = $sth->fetchrow_hashref)
+        {
+		my $orf_seq = $mbl->get_orf_nt_sequence($orf->{orfid});
+		my $text_type = '';
+		my $text_desc = '';
+		my $annotation = $mbl->get_newest_annotation($orf->{orfid});
+		if($annotation eq 'No annotation')
+		{
+			my $blast_row = $mbl->get_top_orf_hit($orf->{orfid});
+			if($blast_row)
+			{
+				$text_type = 'blasthit ' . $blast_row->{evalue};
+				$text_desc = $blast_row->{hit_name} . $blast_row->{description};
+			} else
+			{
+				$text_type = 'Hypothetical Protein';
+			}
+		} else
+		{
+			$text_type = 'annotation';
+			$text_desc = $annotation;
+		}
+		my $orf_name = $orf->{orfid};
+		my $orf_desc = "|$text_type|$text_desc";
+#                print ORFFILE ">" . $orf->{orfid} . "|$text_type|$text_desc" .  "\n";
+
+                # load this sequence into a sequence object
+                my $this_sequence_obj = Bio::Seq->new( -id=>$orf_name, -desc=>$orf_desc,
+                                -seq =>$orf_seq);
+		$orfaaio->write_seq($this_sequence_obj->translate());
+#                print ORFFILE $this_sequence_obj->translate()->seq();
+#                print ORFFILE "\n";
+        }
+#        close ORFFILE;
+        system('gzip -f ' . $download_dir . 'orfs_aa.fas');
+	$mbl->set_new_file("orfs_aa", "orfs_aa.fas.gz", "orfs", $download_dir . 'orfs_aa.fas.gz', undef);
+
+        # Unused Reads
+
+        open(READFILE, '>', $download_dir . 'unused_reads.fas');
+
+	my $query = "select read_name as readname, upper(bases) as bases from reads_bases where read_name NOT IN (select read_name from reads_assembly)";
+
+        my $sth = $dbh->prepare($query);
+        $sth->execute;
+
+        while(my $read = $sth->fetchrow_hashref)
+        {
+                print READFILE ">" . $read->{readname} . "\n";
+                # load this sequence into a sequence object
+                my $this_sequence_obj = Bio::Seq->new( -id  => 'my_sequence',
+                                -seq =>$read->{bases});
+
+                print READFILE $this_sequence_obj->seq();
+                print READFILE "\n";
+        }
+        close READFILE;
+
+        system('gzip -f ' . $download_dir . 'unused_reads.fas');
+	$mbl->set_new_file("unused_reads", "unused_reads.fas.gz", "assembly", $download_dir . 'unused_reads.fas.gz', undef);
+
+	# Used Reads
+        open(READFILE, '>', $download_dir . 'used_reads.fas');
+
+        my $query = "select reads.read_name as readname, reads_assembly.read_name, upper(reads_bases.bases) as bases
+                        FROM
+                        reads_bases,
+                        reads left join reads_assembly ON reads.read_name=reads_assembly.read_name
+                        WHERE reads.read_name = reads_bases.read_name AND reads_assembly.read_name is not null";
+
+        my $sth = $dbh->prepare($query);
+        $sth->execute;
+
+        while(my $read = $sth->fetchrow_hashref)
+        {
+                print READFILE ">" . $read->{readname} . "\n";
+                # load this sequence into a sequence object
+                my $this_sequence_obj = Bio::Seq->new( -id  => 'my_sequence',
+                                -seq =>$read->{bases});
+
+                print READFILE $this_sequence_obj->seq();
+                print READFILE "\n";
+        }
+        close READFILE;
+
+        system('gzip -f ' . $download_dir . 'used_reads.fas');
+	$mbl->set_new_file("used_reads", "used_reads.fas.gz", "assembly", $download_dir . 'used_reads.fas.gz', undef);
+
+	# All Reads
+#	open(ALLREAD, ">", $download_dir . 'all_reads.fas');
+	my $readio = Bio::SeqIO->new(-file=>">$download_dir" . 'all_reads.fas', -format=>'fasta');
+	
+	my $query = "select distinct read_name, upper(bases) as bases from reads_bases";
+	my $sth = $dbh->prepare($query);
+	$sth->execute;
+	while(my $read = $sth->fetchrow_hashref)
+	{
+#		print ALLREAD ">" . $read->{read_name} . "\n";
+		my $this_sequence_obj = Bio::Seq->new( -display_id  => $read->{read_name},
+					-seq =>$read->{bases});
+		$readio->write_seq($this_sequence_obj);
+#		print ALLREAD $this_sequence_obj->seq();
+#		print ALLREAD "\n";
+	}
+
+        system('gzip -f ' . $download_dir . 'all_reads.fas');
+	$mbl->set_new_file("all_reads", "all_reads.fas.gz", "assembly", $download_dir . 'all_reads.fas.gz', undef);
+
+	# Contigs
+#	open(CONTIGS, ">", $download_dir . 'contigs.fas');
+	my $contigio = Bio::SeqIO->new(-file=>">$download_dir" . 'contigs.fas', -format=>'fasta');
+
+	my $query = "select contig_number, upper(bases) as bases from contigs";
+	my $sth = $dbh->prepare($query);
+	$sth->execute;
+	while(my $contig = $sth->fetchrow_hashref)
+        {
+#                print CONTIGS ">" . $contig->{contig_number} . "\n";
+                my $this_sequence_obj = Bio::Seq->new( -display_id=>$contig->{contig_number},
+                                        -seq =>$contig->{bases});
+		$contigio->write_seq($this_sequence_obj);
+#                print CONTIGS $this_sequence_obj->seq();
+#                print CONTIGS "\n";
+        }
+	system('gzip -f ' . $download_dir . 'contigs.fas');
+	$mbl->set_new_file("contigs", "contigs.fas.gz", "assembly", $download_dir . 'contigs.fas.gz', undef);
+
+	# Orfs as tab delim locations relative to contigs
+
+	open(ORFTAB, '>', $download_dir . 'orf_coord.txt');
+	my $query = "select orfid, contig, start, stop, direction  from orfs where delete_fg = 'N' order by contig, start, stop ";
+	my $handler = $dbh->prepare($query);
+	$handler->execute();
+ 
+        print ORFTAB join("\t", "orfid", "contig", "start", "stop", "direction") . "\n";
+	while(my $row = $handler->fetchrow_hashref)
+	{
+		print ORFTAB join("\t", $row->{orfid}, $row->{contig}, $row->{start}, $row->{stop}, $row->{direction}) . "\n";
+	}
+	$mbl->set_new_file("orf_coord", "orf_coord.txt", "orfs", $download_dir . 'orf_coord.txt', undef);
+
+	# contig lengths and number reads in contig
+	open(CONTIGLEN, ">", $download_dir . 'contig_info.txt');
+	my $contiglenh = $dbh->prepare("select DISTINCT links.super_id, links.contig_length, links.contig_number, count(reads_assembly.read_name) as num_reads from links, reads_assembly where links.contig_number = reads_assembly.contig_number group by  links.super_id, links.contig_length, links.contig_number");
+	$contiglenh->execute();
+	print CONTIGLEN join("\t","contig_id", "contig length", "# of reads", "supercontig_id" ) . "\n";
+	while(my $row = $contiglenh->fetchrow_hashref)
+	{
+		print CONTIGLEN join("\t", 'contig_' . $row->{contig_number}, $row->{contig_length}, $row->{num_reads}, $row->{super_id}) . "\n";
+	}
+	$mbl->set_new_file("contig_info", "contig_info.txt", "assembly", $download_dir . 'contig_info.txt');
+
+	# Supercontig_id, supercontig length, #bp as gaps, # contigs, # reads
+	open(SUPERCONTIGINFO, ">", $download_dir . 'supercontig_info.txt');
+	my $supercontigh = $dbh->prepare("select DISTINCT links.super_id, modified_bases_in_super, ( modified_bases_in_super - bases_in_super) as gaps, count(DISTINCT links.contig_number) as num_contigs, count(reads_assembly.read_name) as num_reads from links, reads_assembly  where links.contig_number = reads_assembly.contig_number group by links.super_id, modified_bases_in_super, ( modified_bases_in_super - bases_in_super)");
+	$supercontigh->execute();
+
+	print SUPERCONTIGINFO join("\t","supercontig_id", "supercontig length", "# of bp's as gaps", "# of contigs", "# of reads" ) . "\n";
+	while(my $row = $supercontigh->fetchrow_hashref)
+	{	
+		print SUPERCONTIGINFO join("\t", 'supercontig_' . $row->{super_id}, $row->{modified_bases_in_super}, $row->{gaps}, $row->{num_contigs}, $row->{num_reads}) . "\n";
+	}
+	$mbl->set_new_file("supercontig_info", "supercontig_info.txt", "assembly", $download_dir . 'supercontig_info.txt');
+	
+	#print "Finished: Create download files\n";
+}
+
+#################################
+#
+# Create Web Files (file: $web_dir/*.html, etc.)
+#
+#	for creating an updated conf file with the tracts
+##S  will need to copy them from temp conf dir up to the website.
+##S  need to fix the path, doesn't start at root.
+#################################
+if($run_options{'create_web_files'})
+{
+	#print "Started: Create web files\n";
+	# For each web file that must be created, open the file, perform a search of !ORGANISM! and replace with $organism
+
+	my $sourceconf = "$executable_location/template/";
+	if ($project_type eq 'est') {
+		$sourceconf .= "estcdna.conf";
+	} elsif ($project_type eq 'genome') {
+		$sourceconf .= "genome.conf";
+	} else {
+		$sourceconf .= "supercontig.conf";
+	}
+        system("cp -f $sourceconf " . $gbrowse_conf_dir . '/' . $organism . 'screads.conf');
+
+	my @modify_array ;
+
+        push @modify_array, $gbrowse_conf_dir . '/' . $organism . 'screads.conf';
+#        push @modify_array, $gbrowse_conf_dir . $organism . '.conf';
+
+
+	my $search = '!ORGANISM!';
+	my $replace = $organism;
+
+	foreach my $file (@modify_array)
+	{
+		print "editing $file\n";
+		my @contents;
+		open(FH, "+< $file")                 or die "Opening: $!";
+		while (<FH>) {
+			my $line = $_;
+			$line =~ s/$search/$replace/g;
+			push(@contents,$line);
+		}
+
+		# change ARRAY here
+		seek(FH,0,0)                        or die "Seeking: $!";
+		print FH @contents                    or die "Printing: $!";
+		truncate(FH,tell(FH))               or die "Truncating: $!";
+		close(FH)                           or die "Closing: $!";
+	}
+	#print "Finished: Create web files\n";
+
+}
+
+#################################
+#
+# Create Output GFF (file: $gff_contig_dir/contig.gff)
+#
+#################################
+if($run_options{'create_read_gff'})
+{
+	#print "Started creating $gff_output_file file\n";
+	open(GFF,'>', "$gff_output_file") or die ("Can not open $gff_output_file file");
+
+	# First Annotate each contig
+	my $gff_query = "select distinct contig_number, contig_length from reads_assembly";
+	my $sth = $dbh->prepare($gff_query);
+        $sth->execute;
+        while(my $this_row = $sth->fetchrow_hashref)
+        {
+          print GFF "contig_" . $this_row->{contig_number} . "\t" .
+	            "ARACHNE" . "\t" .
+                    "contig" . "\t" .
+                    "1" . "\t" .
+                    $this_row->{contig_length} . "\t" .
+		    "." . "\t" .
+                    "." . "\t" .
+                    "." . "\t" .
+                    "Sequence \"contig_" . $this_row->{contig_number} . "\"" . "\n";
+        }
+	$sth->finish;
+
+        # Now Annotate each supercontig with link
+        my $super_query = "select distinct super_id, contigs_in_super,
+                      contig_number, ordinal_number, contig_length from links";
+        $sth = $dbh->prepare($super_query);
+        $sth->execute;
+        while(my $this_row = $sth->fetchrow_hashref)
+        {
+          print GFF "contig_" . $this_row->{contig_number} . "\t" .
+                    "ARACHNE" . "\t" .
+                    "supercontig" . "\t" .
+                    "1" . "\t" .
+                    $this_row->{contig_length} . "\t" .
+                    "." . "\t" .
+                    "." . "\t" .
+                    "." . "\t" .
+                    "Sequence \"supercontig_" . $this_row->{super_id}
+                        . '"' . "\n";
+        }
+        $sth->finish;
+
+
+	#print("Starting to create $gff_supercontig_read_output_file\n");
+
+	open(SUPERGFF, '>', "$gff_supercontig_read_output_file") or die ("Can not open $gff_supercontig_read_output_file");
+
+	my $query = ' select distinct super_id, bases_in_super, modified_bases_in_super FROM links';
+	my $links_result = $dbh->prepare($query);
+	$links_result->execute;
+
+
+	while(my $links_array = $links_result->fetchrow_hashref)
+	{
+		my $stop = 0;
+
+		if($minimum_gap_fg)
+		{
+			$stop = $links_array->{modified_bases_in_super}
+		} else
+		{
+			$stop = $links_array->{bases_in_super}
+		}
+
+		print SUPERGFF     "supercontig_" . $links_array->{super_id}  . "\t" .
+                    "ARACHNE" . "\t" .
+                    "supercontig" . "\t" .
+                    "1" . "\t" .
+                    $stop . "\t" .
+                    "." . "\t" .
+                    "." . "\t" .
+                    "." . "\t" .
+                    "Sequence \"supercontig_" . $links_array->{super_id} . "\"" . "\n";
+
+	}
+
+	$links_result->finish;
+
+        # Place Contigs
+
+        my $query = '
+                select contig_number,
+                super_id,
+                bases_in_super,
+                contigs_in_super,
+                ordinal_number,
+                contig_length,
+                gap_before_contig,
+                gap_after_contig,
+                contig_start_super_base,
+                modified_contig_start_base,
+                modified_bases_in_super
+                FROM
+                links ORDER BY super_id, ordinal_number';
+        my $links_result = $dbh->prepare($query);
+        $links_result->execute;
+
+        my $last_super_id = '';
+        my $super_running_total = 0;
+		my $topBlastHit_h = $dbh->prepare("select * from (select d.name as blastdb_name, d.id as db_id, hit_name, description, evalue from blast_results as b join db as d where d.id = b.db and sequence_type_id=5 and idname=? order by evalue) as h group by blastdb_name");
+        while(my $links_array = $links_result->fetchrow_hashref)
+        {
+			# find best blast hit
+			my $blastString;
+			$topBlastHit_h->execute("contig_" . $links_array->{contig_number});
+			while (my $brow = $topBlastHit_h->fetchrow_hashref)
+			{
+				my $description = $brow->{description};
+				$description =~ s/\"/\\"/ig;
+				$description =~ s/\'/\\'/ig;
+				$description =~ s/;/,/g;
+				$blastString .= ' ; ' . $brow->{blastdb_name} . ' "' . "$brow->{hit_name} | $description | evalue $brow->{evalue}" .'"';
+			}
+
+			my ($super_id, $sc_start, $sc_stop) = $mbl->get_supercontig_coords_from_contig($links_array->{contig_number}, 1, $links_array->{contig_length});
+
+			print SUPERGFF join("\t", "supercontig_" . $super_id, "ARACHNE", "contig", $sc_start, $sc_stop, ".", ".",".","Sequence \"contig_" . $links_array->{contig_number} . '"') . "$blastString\n";
+			#print SUPERGFF join("\t", "supercontig_" . $super_id, "ARACHNE", "contig", $sc_start, $sc_stop, ".", ".",".","Sequence \"contig_" . $links_array->{contig_number} . '"')  . "\n";
+			#print SUPERGFF "supercontig_" . $super_id . "\t" .  "ARACHNE" . "\t" .  "contig" . "\t" .  $sc_start . "\t" .  $sc_stop . "\t" .  "." . "\t" .  "." . "\t" .  "." . "\t" .  "Sequence \"contig_" . $links_array->{contig_number} . '"' . "\n";
+
+        }
+
+        $links_result->finish;
+
+	#Now Annotate each read
+	my $gff_query = "SELECT distinct
+			reads.read_name,
+			r_assem.contig_number,
+			reads.center_name,
+			r_assem.trim_read_in_contig_start,
+			r_assem.trim_read_in_contig_stop,
+			r_assem.orientation,
+			reads.plate_id,
+			reads.well_id,
+			reads.template_id,
+			reads.library_id,
+			r_assem.read_pair_name,
+			r_assem.read_pair_contig_number,
+			r_assem.observed_insert_size,
+			r_assem.given_insert_size,
+			r_assem.given_insert_std_dev,
+			r_assem.observed_inserted_deviation,
+			links.super_id as super_contig_number,
+			links.contig_start_super_base,
+			links.contig_length,
+			links.modified_contig_start_base
+			FROM reads, reads_assembly r_assem, links
+			WHERE reads.read_name = r_assem.read_name
+			AND links.contig_number = r_assem.contig_number";
+	my $sth = $dbh->prepare($gff_query);
+	$sth->execute;
+
+	# Query used in while loop to get information about a read's partner
+                my $check_partner_super_query = "
+		SELECT distinct
+		reads.read_name,
+		r_assem.contig_number,
+		r_assem.read_pair_name,
+		r_assem.read_pair_contig_number,
+		r_assem.trim_read_in_contig_start,
+                r_assem.trim_read_in_contig_stop,
+		links.super_id as super_contig_number,
+		links.contig_start_super_base,
+		links.contig_length,
+		r_assem.orientation
+		FROM reads,
+		reads_assembly r_assem,
+		links
+		WHERE reads.read_name = r_assem.read_name
+		AND links.contig_number = r_assem.contig_number
+		AND reads.read_name = ?";
+	my $inner_check = $dbh->prepare($check_partner_super_query);
+
+
+	# Query used in while loop to check if a partner exists
+	my $check_for_partner_query = 'select read_name from reads where template_id = ?  AND read_name != ?';
+	my $check_for_partner_result = $dbh->prepare($check_for_partner_query);
+
+	while(my $this_row = $sth->fetchrow_hashref)
+	{
+		my $read_type = '';
+
+	       # Check if this read is special :
+	       # 1- it's partner read is unplaced and not missing(it has a partner)
+	       # 2- it's partner read is on another contig
+	       # 3- it's partner read is on another supercontig
+	       # 4- it's partner is unplaced and missing
+	       # 5- it's partner is in the next contig and the gap is positive
+	       # 6- it's partner is in the next contig and the gap is negative
+	       # 7- it's partner is not in the next ordinal contig
+
+                $inner_check->execute($this_row->{read_pair_name});
+                my $inner_row = $inner_check->fetchrow_hashref;
+
+
+		# Do I have a partner?
+		if($this_row->{read_pair_contig_number} eq "") # there is no partner read
+        {
+                        $check_for_partner_result->execute($this_row->{template_id}, $this_row->{read_name});
+                        my $num_rows_ret = $check_for_partner_result->rows;
+                        if($num_rows_ret == 0)
+                        {
+                              $read_type =  'missing-partner';
+                        } else
+                        {
+                              $read_type = 'unplaced-partner';
+                        }
+		} elsif($this_row->{contig_number} eq $this_row->{read_pair_contig_number}) #they are in the same contig
+		{
+			my $read_one_start = get_supercontig_pos($this_row->{contig_number}, $this_row->{trim_read_in_contig_start});
+			my $read_one_stop =  get_supercontig_pos($this_row->{contig_number}, $this_row->{trim_read_in_contig_stop});
+			my $read_two_start = get_supercontig_pos($inner_row->{contig_number}, $inner_row->{trim_read_in_contig_start});
+			my $read_two_stop = get_supercontig_pos($inner_row->{contig_number}, $inner_row->{trim_read_in_contig_stop});
+			if($this_row->{orientation} eq $inner_row->{orientation})
+			{
+				if ($this_row->{read_name} eq $this_row->{read_pair_name})
+				{
+					$read_type = 'read';
+				} else {
+					$read_type = 'partner-orientation-error';
+				}
+			} else
+			{
+				if($this_row->{orientation} eq "+")
+				{
+					if($read_one_start > $read_two_start)
+					{
+						$read_type = 'partner-orientation-error';
+					} else
+					{
+						$read_type = 'read';
+					}
+				} else
+				{
+					if($read_one_start < $read_two_start)
+					{
+						$read_type = 'partner-orientation-error';
+					}
+				}
+	     			$read_type = 'read';
+			}
+		} elsif($inner_row->{super_contig_number} ne $this_row->{super_contig_number}) # They are in different supercontigs
+		{
+			$read_type = 'partner-different-supercontig';
+		} else
+	  	{
+				# Now check if the two contigs overlap
+
+				my $contig_one = $this_row->{contig_number};
+				my $contig_two = $this_row->{read_pair_contig_number};
+				my $read_one_dir = $this_row->{orientation};
+				my $read_two_dir = $inner_row->{orientation};
+
+	            my $read_one_start = get_supercontig_pos($this_row->{contig_number}, $this_row->{trim_read_in_contig_start});
+	            my $read_one_stop =  get_supercontig_pos($this_row->{contig_number}, $this_row->{trim_read_in_contig_stop});
+	            my $read_two_start = get_supercontig_pos($inner_row->{contig_number}, $inner_row->{trim_read_in_contig_start});
+	            my $read_two_stop = get_supercontig_pos($inner_row->{contig_number}, $inner_row->{trim_read_in_contig_stop});
+
+
+				my $contig_one_start = $this_row->{contig_start_super_base};
+				my $contig_two_start = $inner_row->{contig_start_super_base};
+				my $contig_one_end = $this_row->{contig_start_super_base} + $this_row->{contig_length};
+				my $contig_two_end =  $inner_row->{contig_start_super_base} + $inner_row->{contig_length};
+
+			  	if( ($read_one_dir eq "+") && ($read_two_dir eq "-") )
+			  	{
+					if($read_one_start > $read_two_start)
+					{
+						$read_type = 'partner-orientation-error';
+					} elsif($contig_one_end <= $contig_two_start)
+			    		{
+			      			$read_type = "partner-different-contig-positive-gap";
+			    		} else
+			    		{
+	                      			$read_type = "partner-different-contig-negative-gap";
+			    		}
+			  	} elsif( ($read_one_dir eq "-") && ($read_two_dir eq "+") )
+			  	{
+					if($read_one_start < $read_two_start)
+					{
+						$read_type = 'partner-orientation-error';
+					} elsif($contig_one_start >= $contig_two_end)
+	                    		{
+	                      			$read_type = "partner-different-contig-positive-gap";
+	                    		} else
+	                    		{
+	                      			$read_type = "partner-different-contig-negative-gap";
+	                    		}
+			  	} elsif($this_row->{orientation} eq $inner_row->{orientation})
+		                {
+		                	$read_type = "partner-orientation-error";
+		                } else
+			  	{
+			    		$read_type = "partner-different-contig-exception";
+			  	}
+
+			}
+
+		my $read_super_start_val = 0;
+		my $read_super_stop_val = 0;
+		if($minimum_gap_fg)
+		{
+			$read_super_stop_val = $this_row->{trim_read_in_contig_stop} + $this_row->{modified_contig_start_base};
+	            	$read_super_start_val = $this_row->{modified_contig_start_base} + $this_row->{trim_read_in_contig_start};
+		} else
+		{
+			$read_super_stop_val = $this_row->{trim_read_in_contig_stop} + $this_row->{contig_start_super_base};
+			$read_super_start_val = $this_row->{contig_start_super_base} + $this_row->{trim_read_in_contig_start};
+		}
+
+                my $read_pair_name = $this_row->{read_pair_name};
+                if($read_pair_name eq "") { $read_pair_name = "none"; }
+
+		my $read_contig_number = $this_row->{contig_number};
+		if($read_contig_number eq "") { $read_contig_number = "none"; }
+
+                my $read_pair_contig_number = $this_row->{read_pair_contig_number};
+                if($read_pair_contig_number eq "") { $read_pair_contig_number = "0"; }
+
+                my $template_id = $this_row->{template_id};
+                if($template_id eq "") { $template_id = "0"; }
+
+                my $given_insert_size = $this_row->{given_insert_size};
+                if($given_insert_size eq "") { $given_insert_size = "0"; }
+
+                my $given_insert_std_dev = $this_row->{given_insert_std_dev};
+                if($given_insert_std_dev eq "") { $given_insert_std_dev = "0"; }
+
+                my $observed_insert_size = $this_row->{observed_insert_size};
+                if($observed_insert_size eq "") { $observed_insert_size = "0"; }
+
+                my $observed_inserted_deviation = $this_row->{observed_inserted_deviation};
+                if($observed_inserted_deviation eq "") { $observed_inserted_deviation = '0'; }
+
+
+	        print SUPERGFF  join("\t", "supercontig_" . $this_row->{super_contig_number},
+                        	"read",
+				$read_type,
+				$read_super_start_val,
+	                    	$read_super_stop_val,
+	                    	'.',
+	                    	$this_row->{orientation},
+	                    	'.',
+	                    	"read " . $this_row->{read_name} . 
+				' ; ReadPair ' . $read_pair_name . ' ; ReadPairContig ' .
+	                    	$read_pair_contig_number . ' ; ReadContig ' . $read_contig_number .
+                    		' ; TemplateID ' . $template_id .
+                    		' ; GivenInsertSize ' . $given_insert_size .
+                    		' ; GivenInsertStdDev ' . $given_insert_std_dev .
+                    		' ; ObservedInsertSize ' . $observed_insert_size .
+                    		' ; ObservedInsertStdDev ' . $observed_inserted_deviation . ' ;') .
+				"\n";
+
+		print GFF join("\t", "contig_" . $this_row->{contig_number},
+				"read",
+				$read_type,
+				$this_row->{trim_read_in_contig_start},
+				$this_row->{trim_read_in_contig_stop},
+				'.',
+				$this_row->{orientation},
+				'.',
+                                "read " . $this_row->{read_name} .
+                                ' ; ReadPair ' . $read_pair_name . ' ; ReadPairContig ' .
+                                $read_pair_contig_number . ' ; ReadContig ' . $read_contig_number .
+                                ' ; TemplateID ' . $template_id .
+                                ' ; GivenInsertSize ' . $given_insert_size .
+                                ' ; GivenInsertStdDev ' . $given_insert_std_dev .
+                                ' ; ObservedInsertSize ' . $observed_insert_size .
+                                ' ; ObservedInsertStdDev ' . $observed_inserted_deviation . ' ;') .
+				"\n";
+	}
+
+        $sth->finish;
+	#print "Completed creating output.gff file\n";
+
+	#######END OUTPUT SUPERGFF GILE##############
+
+
+
+}
+
+#################################
+#
+# Create Supercontig ORF from DB
+#
+#################################
+if($run_options{'create_supercontig_orf_from_db'})
+{
+	print "Started: Create supercontig orf from db\n";
+	my $selectOrfsSQL = "SELECT orfid, contig, start, stop, direction, attributes, TestCode, CodonPreference, CodonPreferenceScore, CodonUsage, TestScore, GeneScan, GeneScanScore, source FROM orfs where delete_fg = 'N' ";
+	my $selectOrfs_h = $dbh->prepare($selectOrfsSQL);
+	$selectOrfs_h->execute;
+
+	my $topBlastHit_h = $dbh->prepare("select * from (select d.name as blastdb_name, d.id as db_id, hit_name, description, evalue from blast_results as b join db as d where d.id = b.db and sequence_type_id=2 and idname=? order by evalue) as h group by blastdb_name");
+	my $annotation_h = $dbh->prepare("select annotation from annotation where orfid = ? AND delete_fg = 'N' AND blessed_fg = 'Y' order by update_dt DESC limit 1");
+	
+	open(ORFDBSCFILE, ">$gff_supercontig_orf_output_file");
+	open(ORFDBFILE, ">$gff_orf_output_file");
+	open(TRANS, ">", $gff_transcript_file);
+	
+	while(my $this_row = $selectOrfs_h->fetchrow_hashref)
+	{
+		# find best blast hit
+		my %bestHits;
+		$topBlastHit_h->execute($this_row->{orfid});
+		while (my $brow = $topBlastHit_h->fetchrow_hashref)
+		{
+			my $description = $brow->{description};
+			$description =~ s/\"/\\"/ig;
+			$description =~ s/\'/\\'/ig;
+			$description =~ s/;/,/g;
+			$bestHits{$brow->{blastdb_name}} =  $brow->{hit_name} . '|' . $description . '| evalue ' . $brow->{evalue};
+		}
+
+	# Find official annotation (might be just a blast hit
+	my $official_annotation = '';
+	$annotation_h->execute($this_row->{orfid});
+	if($annotation_h->rows == 0)
+	{
+		$official_annotation = 'No official annotation';
+	} else {
+		my $annot_row = $annotation_h->fetchrow_hashref;
+		$official_annotation = $annot_row->{annotation};
+	}
+
+
+	# Check if Tests are available
+	my $testcode = $this_row->{TestCode};
+	my $testcode_score = $this_row->{TestScore};
+	my $genescan = $this_row->{GeneScan};
+	my $genescan_score = $this_row->{GeneScanScore};
+	my $codonpreference = $this_row->{CodonPreference};
+	my $codonpreference_score = $this_row->{CodonPreferenceScore};
+	my $codonusage = $this_row->{CodonUsage};
+
+	if(!$testcode)
+	{
+		$testcode = 'Not Tested';
+		$testcode_score = '0';
+	}
+	if(!$genescan)
+	{
+		$genescan = 'Not Tested';
+		$genescan_score = '0';
+	}
+	if(!$codonpreference)
+	{
+		$codonpreference = 'Not Tested';
+		$codonpreference_score = '0';
+	}
+	if(!$codonusage)
+	{
+		$codonusage = 'Not Tested';
+	}
+
+	my $attributes = 'Orf "' . $this_row->{orfid} .
+		'" ; TestCode "' 	. $testcode .
+		'" ; TestCodeScore "'        . $testcode_score .
+		'" ; GeneScan "'        . $genescan .
+		'" ; GeneScanScore "'        . $genescan_score .
+		'" ; CodonPreference "' . $codonpreference .
+		'" ; CodonPreferenceScore "' . $codonpreference_score .
+		'" ; CodonUsage "' . $codonusage .
+		'" ; Annotation "' . $official_annotation;
+	foreach my $h (sort keys %bestHits)
+	{
+		$attributes .= '" ; ' . $h . ' "' .  $bestHits{$h};
+	}
+	$attributes .= '"';
+
+	my $get_contig_pos_query = "select contig_number, super_id, contig_start_super_base, contig_length, modified_contig_start_base
+			from links where concat('contig_', contig_number) = " . $dbh->quote($this_row->{contig}) ;
+	my $posh = $dbh->prepare($get_contig_pos_query);
+	$posh->execute;
+	my $super_result = $posh->fetchrow_hashref;
+
+	my $new_start = 0;
+	my $new_stop = 0;
+	if($minimum_gap_fg)
+	{
+		$new_start = $this_row->{start} + $super_result->{modified_contig_start_base};
+		$new_stop  = $this_row->{stop} +  $super_result->{modified_contig_start_base};
+	} else
+	{
+		$new_start = $this_row->{start} + $super_result->{contig_start_super_base};
+		$new_stop  = $this_row->{stop} +  $super_result->{contig_start_super_base};
+	}
+
+	print ORFDBSCFILE	join("\t", "supercontig_" . $super_result->{super_id}, $this_row->{source}, 'ORF', $new_start, $new_stop, '.', $this_row->{direction}, '.', $attributes) . "\n";
+
+	print ORFDBFILE join("\t", $this_row->{contig}, $this_row->{source}, 'ORF', $this_row->{start}, $this_row->{stop}, '.', $this_row->{direction}, '.', $attributes) . "\n";
+
+	$posh->finish;
+	if($run_options{'create_transcript_gff'})
+	{
+		my $utr5_start = 0;
+		my $utr5_stop = 0;
+		my $utr3_start = 0;
+		my $utr3_stop = 0;
+		my $contig_length = $mbl->contig_info($this_row->{contig})->{contig_length};
+		if($this_row->{direction} eq "+")
+		{
+				$utr5_start = $this_row->{start} - 6;
+				$utr5_stop = $this_row->{start} - 1;
+			
+				$utr3_start = $this_row->{start} + 1;
+				$utr3_stop = $this_row->{stop} + 16;
+
+				if($utr5_start < 1)
+				{
+					$utr5_start = 1;
+				}
+				if($utr5_stop < 1)
+				{
+					$utr5_stop = 1;
+				}
+
+				if($utr3_start > $contig_length)
+				{
+					$utr3_start = $contig_length;
+				}
+				if($utr3_stop > $contig_length)
+				{
+					$utr3_stop = $contig_length;
+				}
+
+		} else {
+				$utr5_start = $this_row->{stop} + 1;
+				$utr5_stop = $this_row->{stop} + 16;
+			
+				$utr3_start = $this_row->{start} - 6;
+				$utr3_stop = $this_row->{start} - 1;
+
+				if($utr3_start < 1)
+				{
+					$utr3_start = 1;
+				}
+				if($utr3_stop < 1)
+				{
+					$utr3_stop = 1;
+				}
+
+				if($utr5_start > $contig_length)
+				{
+					$utr5_start = $contig_length;
+				}
+				if($utr5_stop > $contig_length)
+				{
+					$utr5_stop = $contig_length;
+				}
+
+		}
+
+		# Print Gene
+		print TRANS	join("\t", "supercontig_" . $super_result->{super_id},
+				$this_row->{source},
+				'gene',
+				$new_start,
+				$new_stop,
+	                        '.',
+				$this_row->{direction},
+	                        '.',
+				'Gene ' . $this_row->{orfid} . ' ;' . $attributes  ) . "\n";
+		# Print mRNA
+		print TRANS	join("\t", "supercontig_" . $super_result->{super_id},
+				$this_row->{source},
+				'mRNA',
+				$new_start,
+				$new_stop,
+	                        '.',
+				$this_row->{direction},
+	                        '.',
+				'mRNA ' . $this_row->{orfid} . ' ;' . ' ; Gene ' . $this_row->{orfid} . ';' ) . "\n";
+
+		# Print 5' UTR
+		print TRANS	join("\t", "supercontig_" . $super_result->{super_id},
+				$this_row->{source},
+				"5'-UTR",
+				$super_result->{modified_contig_start_base} + $utr5_start,
+				$super_result->{modified_contig_start_base} + $utr5_stop,
+				'.',
+				$this_row->{direction},
+				".",
+				'mRNA ' . $this_row->{orfid} . ' ;') . "\n";
+		# Print CDS
+		print TRANS	join("\t", "supercontig_" . $super_result->{super_id},
+				$this_row->{source},
+				'CDS',
+				$new_start,
+				$new_stop,
+	                        '.',
+				$this_row->{direction},
+	                        '0',
+				'mRNA ' . $this_row->{orfid} . ' ;' ) . "\n";
+
+		# Print 3' UTR
+		print TRANS	join("\t", "supercontig_" . $super_result->{super_id},
+				$this_row->{source},
+				"3'-UTR",
+				$super_result->{modified_contig_start_base} + $utr3_start,
+				$super_result->{modified_contig_start_base} + $utr3_stop,
+				'.',
+				$this_row->{direction},
+				".",
+				'mRNA ' . $this_row->{orfid} . ' ;') . "\n";
+	}
+  }
+
+  #print "Finished: Create supercontig orf from db\n";
+
+}
+
+
+#################################
+#
+# Compare Sequences (files: compare.gff, supercontig_compare.gff)
+#
+#  Not currently being used
+#################################
+if($run_options{'compare_sequences_output_gff'})
+{
+	my $ref_file = $fasta_bases_file;
+	my $query_file = "/home/morrison/Arachne_data/gl102903/mib_run1/assembly.bases";
+    
+    
+	my $temp_mummer_file = 'temp/' . $organism . '_mumcompfile.mum';
+    
+	my $ref_percent = 1.5;
+    
+	my %ref_length;
+	my %query_length;
+
+	open(CONTIGGFF, ">", $gff_compare_file);
+	open(SUPERGFF, ">", $gff_supercontig_compare_file);
+    
+    
+	# Place sequence lengths in hash to be used later
+
+	my $ref_seq = Bio::SeqIO->new(	'-file' => "$ref_file",
+					'-format' => 'Fasta');
+    
+	while(my $seq = $ref_seq->next_seq())
+	{
+		my ($contig_id) = $seq->display_id() =~ /(\d+)/;
+		$ref_length{$contig_id} = $seq->length();
+	}
+    
+	my $query_seq = Bio::SeqIO->new( '-file' => "$query_file",
+					 '-format' => 'Fasta');
+    
+	while(my $seq = $query_seq->next_seq())
+	{
+		my ($contig_id) = $seq->display_id() =~ /(\d+)/;
+		$query_length{$contig_id} = $seq->length();
+	}
+    
+    
+	# Now run mummer
+    
+	system( join(" ", $mummer_bin, $mummer_options, $ref_file, $query_file, '>', $temp_mummer_file) );
+    
+	# Now parse mummer file
+    
+	open(MUMMEROUT, $temp_mummer_file);
+    
+    
+	my $ref_contig = '';
+	my $query_contig = '';
+	my $dir = '+';
+	my $last_query_contig = '';
+	my $last_ref_contig = '';
+	my @matches;
+    
+	while(<MUMMEROUT>)
+	{
+		my $line = $_;
+		if($line =~ /^>/) # This is a header line for a new contig
+		{
+			($ref_contig) = $line =~ /^> ([\w\.]+)/;
+			if($line =~ /Reverse$/)
+			{
+				$dir = "-";
+			} else
+			{
+				$dir = "+";
+			}
+	    
+		} else # This is a match result line
+		{
+			my $stop = '';
+			my (undef, $query_contig, undef, $start, $size) = split(/\s+/, $line);
+	    
+			if($dir eq "-")
+			{
+				$stop = $start;
+				$start = $stop - $size + 1;
+			} else
+			{
+				$stop = $start + $size;
+			}
+			my @curr_array = ($ref_contig, $query_contig, $start, $stop, $size, $dir);
+			push(@matches, \@curr_array);
+	    
+			$last_query_contig = $query_contig;
+			$last_ref_contig = $ref_contig;
+		}
+	}
+    
+    
+	my @match_list;
+	my $query_match;
+	my $last_match = $matches[0];
+
+
+	foreach $query_match (@matches)
+	{
+		if($query_match->[1] eq $last_match->[1])
+		{
+		push(@match_list, $query_match);
+		} else
+		{
+			# This match is a new set of matches
+			check_if_valid_and_print(\@match_list);
+			@match_list = ();
+			push(@match_list, $query_match);
+		}
+		$last_match = $query_match;
+	}
+    
+	sub check_if_valid_and_print
+	{
+	
+		my $check_array = shift;
+		my $match_total_size = 0;
+		my $contig_name;
+		foreach my $check_match (@$check_array)
+		{
+			my @this_row = @$check_match;
+			$match_total_size += $this_row[4];
+			$contig_name = $this_row[1];
+		}
+		my ($contig_id) = $contig_name =~ /(\d+)/;
+		if($query_length{$contig_id} <= ($match_total_size * $ref_percent) )
+		{
+			print_gff($check_array, $match_total_size);
+		}
+	
+	}
+
+
+
+	sub print_gff
+	{
+    
+		my $match_list = shift;
+		my $match_size = shift;
+		my ($q_contig_id) = $match_list->[0]->[1] =~ /(\d+)/;
+		my ($r_contig_id) =  $match_list->[0]->[0] =~ /(\d+)/;
+
+		print "Query Contig " . $match_list->[0]->[1] . " matches on " . $match_list->[0]->[0] . " query full contig is " . $query_length{$q_contig_id} . " and match length is $match_size\n";
+		foreach my $line (@$match_list)
+		{
+			my $start =  $line->[2];
+			my $stop =   $line->[3];
+			my $get_contig_pos_query = "select contig_number, super_id,
+	                			contig_start_super_base, contig_length, modified_contig_start_base
+			                        from links where contig_number = '" . $r_contig_id . "'";
+			my $posh = $dbh->prepare($get_contig_pos_query);
+			$posh->execute;
+			my $super_result = $posh->fetchrow_hashref; 
+			my $new_start = 0;
+			my $new_stop = 0;
+			if($minimum_gap_fg)
+			{
+				$new_start = $start + $super_result->{modified_contig_start_base};
+				$new_stop  = $stop +  $super_result->{modified_contig_start_base};
+			} else
+			{
+				$new_start = $start + $super_result->{contig_start_super_base};
+				$new_stop  = $stop +  $super_result->{contig_start_super_base};
+			}
+
+			print CONTIGGFF join("\t", 'contig_' . $r_contig_id, 'MUMmer', 'reference_match', $line->[2], $line->[3], $line->[5], '.', '.', 'contig_match contig_' . $q_contig_id) . "\n"; 
+			print SUPERGFF  join("\t", 'supercontig_' . $super_result->{super_id}, 'MUMmer', 'reference_match', $line->[2], $line->[3], $line->[5], '.', '.', 'contig_match contig_' . $q_contig_id) . "\n";
+		}
+
+	}
+
+}
+
+#################################
+#
+# Create SAGE from DB (files: sage.gff, supercontig_sage.gff)
+#
+#################################
+if($run_options{'create_sage_from_db'})
+{
+	
+  print "Creating sage output file\n";
+
+  my $result = $dbh->prepare("select tagid, id, contig, start, stop, direction, assignment FROM tagmap where contig is not NULL");
+  $result->execute;
+
+  my $sage_orfh = $dbh->prepare("select orfid, tagid, tagmapid, tagtype, unique_genome_fg, unique_trans_fg from orftosage where tagmapid = ? AND tagid = ?");
+
+  my $sagemaph = $dbh->prepare("select count(*) as mapcount from tagmap where tagid = ?");
+
+
+  open(SAGEDBSCFILE, ">$gff_supercontig_sage_output_file");
+  open(SAGEDBFILE, ">$gff_sage_output_file");
+
+  # Get the percentages in each library also, first get the totals for each library
+
+  	my $percent_query = 'select library, sum(result) as total_tags from sage_results group by library';
+  	my $percent_h = $dbh->prepare($percent_query);
+  	$percent_h->execute();
+
+	# Now take each grand total value and put it into a hash
+        my %total_hash;
+        while(my $percent_row = $percent_h->fetchrow_hashref)
+        {
+                $total_hash{$percent_row->{library}} = $percent_row->{total_tags};
+        }
+
+  my $libh = $dbh->prepare("select tagid, library, result from sage_results where tagid = ?");
+
+  while(my $this_row = $result->fetchrow_hashref)
+  {
+	$libh->execute($this_row->{tagid});
+	my $library_results = '';
+
+
+	while(my $lib_row = $libh->fetchrow_hashref)
+	{
+		$library_results = $library_results .   " ; library_" . $lib_row->{library} . " " . $lib_row->{result} .
+						     	" ; librarypercent_" . $lib_row->{library} . " " . $lib_row->{result}/$total_hash{$lib_row->{library}}*100 ;
+	}
+
+	# Now determine if we have mapped ourselves to an orf, and if so what kind of mapping it is
+	$sage_orfh->execute($this_row->{id}, $this_row->{tagid});
+
+	my $sageorf_results = '';
+	if($sage_orfh->rows > 0)
+	{
+		my $sageorf_row = $sage_orfh->fetchrow_hashref;
+		$sageorf_results = 'Orf ' . $sageorf_row->{orfid} . ' ; TagType "' . $sageorf_row->{tagtype} .  
+					'" ; UniqueTranscript ' . $sageorf_row->{unique_trans_fg}. ' ; ' ;
+	}
+	
+	$sagemaph->execute($this_row->{tagid});
+	my $sagemapnumrow = $sagemaph->fetchrow_hashref;
+	my $sagemapnum = $sagemapnumrow->{mapcount};
+
+	my $sageorf_results .= 'MapCount ' . $sagemapnum . ' ; ';
+
+
+        my $get_contig_pos_query = "select contig_number, super_id,
+                        contig_start_super_base, contig_length, modified_contig_start_base
+                        from links where concat('contig_', contig_number) = '" . $this_row->{contig} . "'";
+        my $posh = $dbh->prepare($get_contig_pos_query);
+        $posh->execute;
+        my $super_result = $posh->fetchrow_hashref;
+	my $new_start = 0;
+	my $new_stop = 0;
+	if($minimum_gap_fg)
+	{
+                $new_start = $this_row->{start} + $super_result->{modified_contig_start_base};
+                $new_stop  = $this_row->{stop} +  $super_result->{modified_contig_start_base};
+	} else
+	{
+        	$new_start = $this_row->{start} + $super_result->{contig_start_super_base};
+	        $new_stop  = $this_row->{stop} +  $super_result->{contig_start_super_base};
+	}
+
+        print SAGEDBSCFILE       join("\t", "supercontig_" . $super_result->{super_id},
+                        'sage',
+                        'sagetag',
+                        $new_start,
+                        $new_stop,
+                        '.',
+                        $this_row->{direction},
+                        '.',
+                        'sagetag ' . $this_row->{tagid} . ' ; sagemapid ' . $this_row->{id} . ' ; AssignmentType "' . $this_row->{assignment} . '"' .  $library_results . ' ; ' . $sageorf_results) . "\n";
+			
+        print SAGEDBFILE join("\t", $this_row->{contig},
+                        'sage',
+                        'sagetag',
+                        $this_row->{start},
+                        $this_row->{stop},
+                        '.',
+                        $this_row->{direction},
+                        '.',
+                        'sagetag ' . $this_row->{tagid} . ' ; sagemapid ' . $this_row->{id} . ' ; AssignmentType "' . $this_row->{assignment} . '"' . $library_results . ' ; ' . $sageorf_results) . "\n";
+
+        $posh->finish;
+  }
+
+}
+#################################
+#
+# Create Intergenic BLAST from DB (files: intergenic.gff, supercontig_intergenic.gff)
+#
+#################################
+if($run_options{'create_intergenic_blast_from_db'})
+{
+	#print "Started: Create intergenic blast from db\n";
+        open(INTER, ">", $gff_intergenic_file);
+        open(SUPERINTER, ">", $gff_supercontig_intergenic_file);
+
+	my $get_blast_hits_query = "select id, idname, score, query_start, query_end, hit_start, hit_end, hsp_strand, description, accession_number, evalue from blast_results where sequence_type_id = 3 AND evalue < 1e-40 AND db= 2  AND (description not like '%ATCC 50803%' OR description like '%gb|%')";
+	my $get_blast_h = $dbh->prepare($get_blast_hits_query);
+
+	$get_blast_h->execute();
+	
+	my $get_contig_pos_query = "select contig_number, super_id,
+                                        contig_start_super_base, contig_length, modified_contig_start_base
+                                        from links where contig_number = ?";
+	my $posh = $dbh->prepare($get_contig_pos_query);
+	
+	while(my $blast_hit = $get_blast_h->fetchrow_hashref)
+	{
+		my (undef, $contig_number, $region_start, $region_stop) = split("_", $blast_hit->{idname});
+		$posh->execute($contig_number);
+
+		my $super_result = $posh->fetchrow_hashref;
+		my $start = $region_start + $blast_hit->{query_start};
+		my $stop = $region_start + $blast_hit->{query_end};
+		my $orientation;
+
+		if($blast_hit->{hsp_strand} > 0)
+		{
+			$orientation = "+";
+		} else
+		{
+			$orientation = "-";
+		}
+
+                my $new_start = 0;
+                my $new_stop = 0;
+                if($minimum_gap_fg)
+                {
+                        $new_start = $start + $super_result->{modified_contig_start_base};
+                        $new_stop  = $stop +  $super_result->{modified_contig_start_base};
+                } else
+                {
+                        $new_start = $start + $super_result->{contig_start_super_base};
+                        $new_stop  = $stop +  $super_result->{contig_start_super_base};
+                }
+		
+		my $description = 'Note "Blastp hit against nr database for Accession ' . $blast_hit->{accession_number} 
+					. ' : ' . $blast_hit->{description} 
+					. ' eval(' . $blast_hit->{evalue} . ') ' 
+					. ' Hit sequence match (' . $blast_hit->{hit_start} . '..' . $blast_hit->{hit_end} . ') ' .
+					'" ; Accession "' . $blast_hit->{accession_number} . '";';
+                                                                                                                                                                                                                                               
+                        print SUPERINTER  join("\t", "supercontig_" . $super_result->{super_id},
+                                'blastx',
+                                'match',
+                                $new_start,
+                                $new_stop,
+                                '.',
+                                $orientation,
+                                '.',
+                                "match " . $blast_hit->{id} . '_' . $blast_hit->{accession_number} . ' ; ' . $description) . "\n";
+                        print INTER join("\t", "contig_" . $contig_number,
+                                'blastx',
+                                'match',
+                                $start,
+                                $stop,
+                                '.',
+                                $orientation,
+                                '.',
+                                "match " . $blast_hit->{id} . '_' . $blast_hit->{accession_number} . ' ; ' . $description) . "\n";
+                                                                                                                                                                                                                                                       
+                        $posh->finish;
+
+	}
+	#print "Finished: Create intergenic blast from db\n";
+}
+
+#################################
+#
+# Create Domains from DB (file: supercontig_domains.gff)
+#
+#################################
+if($run_options{'create_domains_from_db'})
+{
+	#print "Started: Create domains from db\n";
+	open(SUPERPFAM, ">", $gff_supercontig_domains_file);
+	my $get_blast_hits_query = "select br.id, br.idname, br.score, br.query_start, br.query_end, br.accession_number, br.hit_start, br.hit_end, br.hsp_strand, br.description, br.accession_number, br.hit_name, br.evalue, br.primary_id, al.name as algorithms_name, db.name as db_name from blast_results br, db, algorithms al where br.sequence_type_id = 2 AND (br.evalue < 1e-3 OR br.evalue is NULL) AND al.id = br.algorithm AND db.id = br.db AND db.name = 'interpro'";
+	my $get_blast_h = $dbh->prepare($get_blast_hits_query);
+	$get_blast_h->execute();
+	
+	while(my $row = $get_blast_h->fetchrow_hashref)
+	{
+		my $domain_start = 0;
+		my $domain_stop = 0;
+		my $dir = '';
+		# Find which contig this orf is on:
+		my $orfinfo = $mbl->get_orf_attributes_hash($row->{idname});;
+		
+		my ($super_id, $new_start, $new_stop) = $mbl->get_supercontig_coords_from_contig($orfinfo->{contig}, $orfinfo->{start}, $orfinfo->{stop}, $minimum_gap_fg);
+
+		if($orfinfo->{direction} eq "+")
+		{
+			$domain_start = $new_start + ($row->{query_start} * 3);
+			$domain_stop = $new_start + ($row->{query_end} * 3);
+			$dir = "+";
+		} else
+		{
+			$domain_start = $new_start + ($row->{query_stop} * 3);
+			$domain_stop = $new_start + ($row->{query_start} * 3);
+			$dir = "-";
+		}
+		my $eval = $row->{evalue};
+		if($eval eq undef || $eval eq "")
+		{
+			$eval = ".";
+		}
+		print SUPERPFAM join("\t", "supercontig_" . $super_id, 'interpro', 'match', $domain_start, $domain_stop, $eval, $dir, '0', 'interpro ' . $row->{accession_number} . ' ; Description "' . $row->{description} . '" ;  InterproDescription "' . $row->{hit_name} . '" ; Algorithm "' . $row->{algorithms_name} . '" ; Orf "' . $row->{idname} . '" ; query_start ' . $row->{query_start} . ' ; query_end ' . $row->{query_end} . ' ; ' ) . "\n";
+	}
+
+
+}
+
+#################################
+#
+# Load Data from old 
+#
+##S	Versioning, if do an update of an organism to a new database
+##S	
+#################################
+if($run_options{'load_data_from_old'})
+{
+	#print "Started: loading data from old\n";
+	$dbh->do("delete from algorithms");
+	$dbh->do("delete from db");
+	$dbh->do("delete from html");
+	$dbh->do("delete from sage_library_names");
+	$dbh->do("delete from sequence_type");
+	$dbh->do("delete from templates");
+	$dbh->do("delete from user");
+	$dbh->do("delete from user_rights");
+	$dbh->do("delete from evidence_codes");
+
+	$dbh->do("insert into algorithms select * from $old_orf_database.algorithms");
+	$dbh->do("insert into db select * from $old_orf_database.db");
+	$dbh->do("insert into html select * from $old_orf_database.html");
+	$dbh->do("insert into sage_library_names select * from $old_orf_database.sage_library_names");
+	$dbh->do("insert into sequence_type select * from $old_orf_database.sequence_type");
+	$dbh->do("insert into templates select * from $old_orf_database.templates");
+	$dbh->do("insert into evidence_codes select * from $old_orf_database.evidence_codes");
+	$dbh->do("insert into user select * from $old_orf_database.user");
+	$dbh->do("insert into user_rights select * from $old_orf_database.user_rights");
+
+
+	$dbh->do("update html set value = '$organism' where variable = 'database_name'");
+	#print "Finished: loading data from old\n";
+}
+
+#################################
+#
+# Populate Intergenic Search
+#
+#################################
+if($run_options{'populate_intergenic_search'})
+{
+	warn "Started: populate intergenic search\n";
+
+	my $find_blank_orfs = 1;
+
+	my $contigseqh = $dbh->prepare("select contig_number, substring(bases, ?, ?) as seq from contigs where contig_number = ?");
+	my $insert_search_h = $dbh->prepare('insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate) VALUES (?, ?, ?, ?, ?, ?)');
+
+
+	my $contigh = $dbh->prepare("select distinct contig_number, contig_length from links order by contig_number");
+	$contigh->execute();
+
+	while(my $contighash = $contigh->fetchrow_hashref)
+	{
+		#  use an array to determine what parts of the contig are covered
+		my @coverage_array;
+		# initialize the array
+		for(1..$contighash->{contig_length})
+		{
+			$coverage_array[$_] = 0;
+		}
+		my $orfh = $dbh->prepare("select start, stop, direction, delete_fg, delete_reason from orfs where delete_fg = 'N' and contig = 'contig_" . $contighash->{contig_number} . "'");
+		$orfh->execute();
+		while(my $orfhash = $orfh->fetchrow_hashref)
+		{
+			my $start = $orfhash->{start};
+			my $stop = $orfhash->{stop};
+
+			for($start..$stop)
+			{
+				$coverage_array[$_] = 1;
+			}
+		}
+		# At this point all of coverage array has a 0 or a 1, 1 indicating there is an orf at that location
+		# Now find all streches of 0's that are larger then 100 bp's
+		my $temp_start = 0;
+		my $temp_stop = 0;
+		for(1..$contighash->{contig_length})
+		{
+			if($coverage_array[$_] == 0)
+			{
+				if($temp_start == 0)
+				{
+					$temp_start = $_;
+					$temp_stop = $_;
+				} else {
+					$temp_stop = $_;
+				}
+			} else {
+				# This is an area of coverage
+				if($temp_start != 0)
+				{
+					# This is the end of an area of no coverage
+					# Check if the portion of no coverage is at least 10 bp's, and if it is,
+					if($temp_stop - $temp_start > 1)
+					{
+						$contigseqh->execute($temp_start, $temp_stop - $temp_start, 'contig_' . $contighash->{contig_number});
+						my $sequence_hash = $contigseqh->fetchrow_hashref;
+						$insert_search_h->execute("contig_" . $contighash->{contig_number} . "_" . $temp_start . "_" . $temp_stop, 3, 2, 2, $sequence_hash->{seq}, 'N');
+						#print ">" . "contig_" . $contighash->{contig_number} . "_" . $temp_start . "_" . $temp_stop . "\n" . uc($sequence_hash->{seq}) . "\n";
+						$temp_start = 0;
+						$temp_stop = 0;
+					}
+
+					$temp_start = $_;
+					$temp_stop = $_;
+				}
+			}
+		}
+	}
+	warn "Finished: populate intergenic search\n";
+
+}
+
+#################################
+#
+# Populate Slices Search
+#
+#################################
+if($run_options{'populate_slices_search'})
+# watch to see if you need to clear out the old ones.
+{
+	#print "Started: populate slices search\n";
+
+	# Slices via NR
+	$dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate)
+        	select sliceid, '7', '2', '2', sequence, 'N' from slices");
+ 
+	# Slices via Swiss Prot
+	$dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate)
+	        select sliceid, '7', '3', '2', sequence, 'N' from slices");
+
+	#print "Finished: populate slices search\n";
+}
+##END: Populate Slices Search
+
+
+#################################
+#
+# Populate Search Table
+#
+#################################
+if($run_options{'populate_search_table'})
+{
+	#print "Started: populate search table\n";
+	# Orfs via NR
+	$dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate)
+        	select orfid, '2', '2', '3', sequence, 'Y' from orfs where delete_fg = 'N'");
+ 
+	# Orfs via Swiss Prot
+	$dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate)
+	        select orfid, '2', '3', '3', sequence, 'Y' from orfs where delete_fg = 'N'");
+
+	# Orfs via Pfam
+	$dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id,sequence, translate)
+	        select orfid, '2', '4', '4', sequence, 'Y' from orfs where delete_fg = 'N'");
+
+#	# Sagetags via nt
+#	$dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate) 
+#		select tagid, '4', '1', '1', sequence, 'N' from sage_tags");
+
+        # Orfs via mitop
+        $dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate)
+                select orfid, '2', '6', '3', sequence, 'Y' from orfs where delete_fg = 'N'");
+
+	# Contigs in 6 frame translation via nr < Not sure if I want to do this yet>
+	 $dbh->do("insert into sequence_search (idname, sequence_type_id, db_id, algorithm_id, sequence, translate)
+		select contig_number, '5', '2', '2', bases, 'N' from contigs");
+	
+	#print "Finished: populate search table\n";
+}
+
+
+if($run_options{'start_cluster_blast'})
+{
+	# This doesn't work yet
+#	my $ssh = Net::SSH::Perl->new("master.cl02.mbl.edu", {protocol=>"2", cipher=>"blowfish-cbc"});
+#	$ssh->login("mcipriano", "");
+#	my $command = "qsub /xraid/habitat/mcipriano/cblast_all/submit_generic.sh -v ORGANISM=$organism";
+#	my $times_submit = 20;
+#	while($times_submit > 0)
+#	{
+#		print $ssh->cmd($command);
+#		$times_submit--;
+#		sleep 15;
+#	}
+}
+
+
+
+#################################
+#
+# Load DB
+#
+#################################
+if($run_options{'load_db'})
+{
+	#print "Start: load database\n";
+
+	#Load data local infile which is invoked by bp_bulk_load_gff.pl does not work over the private network with jumbo frames. 
+	#For this call we are using the public network address.
+	#my $publicNetworkHostname = "128.128.174.75";
+
+  # Next process organismscreads
+
+  if($minimum_gap_fg)
+  {
+
+    system("$database_bulk_loader --local --create --password $password --user gid --database dbi:mysql:$db_supercontig_read_database_name:$hostname $gff_supercontig_read_output_file $gff_supercontig_orf_output_file $gff_supercontig_sage_output_file $gff_supercontig_repeat_file $gff_supercontig_compare_file $gff_supercontig_trna_file  $gff_supercontig_coverage_file $gff_supercontig_intergenic_file $gff_supercontig_matches $gff_retrotransposon_file $gff_snrna_file $gff_snorna_file $gff_hyb_file $gff_antisense_file $gff_sts_file $gff_rdna_file $gff_telomericrepeat_file $gff_transcription_file $gff_rfam_file $gff_primers_file $gff_supercontig_domains_file $gff_supercontig_quality_file $gff_cdna_file $fasta_cdna_file $modified_reads_fasta_file $supercontig_fasta_file");
+    #system("$database_bulk_loader --local --create --password $password --user gid --database dbi:mysql:$db_supercontig_read_database_name:$publicNetworkHostname $gff_supercontig_read_output_file $gff_supercontig_orf_output_file $gff_supercontig_sage_output_file $gff_supercontig_repeat_file $gff_supercontig_compare_file $gff_supercontig_trna_file  $gff_supercontig_coverage_file $gff_supercontig_intergenic_file $gff_supercontig_matches $gff_retrotransposon_file $gff_snrna_file $gff_snorna_file $gff_hyb_file $gff_antisense_file $gff_sts_file $gff_rdna_file $gff_telomericrepeat_file $gff_transcription_file $gff_rfam_file $gff_primers_file $gff_supercontig_domains_file $gff_supercontig_quality_file $gff_cdna_file $fasta_cdna_file $modified_reads_fasta_file $supercontig_fasta_file");
+
+  } else {
+  	#This didn't have $hostname at all, which is surprising and I am adding it in, because I think it should be there.
+    #system("$database_bulk_loader --local --create --password $password --user gid --database dbi:mysql:$db_supercontig_read_database_name $gff_supercontig_read_output_file $gff_supercontig_orf_output_file $gff_supercontig_sage_output_file $gff_supercontig_repeat_file $gff_supercontig_compare_file $gff_supercontig_trna_file  $gff_supercontig_coverage_file $gff_supercontig_intergenic_file $gff_supercontig_matches $gff_supercontig_quality_file $gff_cdna_file $gff_supercontig_domains_file $fasta_cdna_file $modified_reads_fasta_file ");
+    system("$database_bulk_loader --local --create --password $password --user gid --database dbi:mysql:$db_supercontig_read_database_name:$hostname $gff_supercontig_read_output_file $gff_supercontig_orf_output_file $gff_supercontig_sage_output_file $gff_supercontig_repeat_file $gff_supercontig_compare_file $gff_supercontig_trna_file  $gff_supercontig_coverage_file $gff_supercontig_intergenic_file $gff_supercontig_matches $gff_supercontig_quality_file $gff_cdna_file $gff_supercontig_domains_file $fasta_cdna_file $modified_reads_fasta_file ");
+    #system("$database_bulk_loader --local --create --password $password --user gid --database dbi:mysql:$db_supercontig_read_database_name:$publicNetworkHostname $gff_supercontig_read_output_file $gff_supercontig_orf_output_file $gff_supercontig_sage_output_file $gff_supercontig_repeat_file $gff_supercontig_compare_file $gff_supercontig_trna_file  $gff_supercontig_coverage_file $gff_supercontig_intergenic_file $gff_supercontig_matches $gff_supercontig_quality_file $gff_cdna_file $gff_supercontig_domains_file $fasta_cdna_file $modified_reads_fasta_file ");
+  }
+
+
+
+}
+
+
+
+#################################
+#
+# SUB get_supercontig_pos
+#
+#################################
+
+sub get_supercontig_pos
+{
+	my $contig = shift;
+	my $pos = shift;
+	my $new_pos = 0;
+	my $get_contig_pos_query = "select contig_number, super_id,
+               contig_start_super_base, contig_length, modified_contig_start_base
+               from links where contig_number = ?";
+	my $posh = $dbh->prepare($get_contig_pos_query);
+	$posh->execute($contig);
+	my $super_result = $posh->fetchrow_hashref;
+
+	if($minimum_gap_fg)
+	{
+	        $new_pos = $pos + $super_result->{modified_contig_start_base};
+	} else
+	{
+	        $new_pos = $pos + $super_result->{contig_start_super_base};
+	}
+	return ($super_result->{super_id}, $new_pos);
+}
+#################################
+#
+# SUB get_supercontig_offset
+#
+#################################
+sub get_supercontig_offset
+{
+        my $contig = shift;
+        my $pos = 1;
+	my $new_pos = 0;
+        my $get_contig_pos_query = "select contig_number, super_id,
+               contig_start_super_base, contig_length, modified_contig_start_base
+               from links where contig_number = ?";
+        my $posh = $dbh->prepare($get_contig_pos_query);
+        $posh->execute($contig);
+        my $super_result = $posh->fetchrow_hashref;
+                                                                                                                                                                                                                                                      
+        if($minimum_gap_fg)
+        {
+                $new_pos = $pos + $super_result->{modified_contig_start_base};
+        } else
+        {
+                $new_pos = $pos + $super_result->{contig_start_super_base};
+        }
+        return ($super_result->{super_id}, $new_pos);
+
+}
+
+#################################
+#
+# SUB debug
+#
+#################################
+sub debug
+{
+	my $message = shift;
+	my $level = shift;
+	if(!defined($level))
+	{
+		$level = 1;
+	}
+	
+	if($level <= $debug)
+	{
+		print $message . "\n";
+	}
+}
+
+
+sub create_assembly_fasta
+{
+	my $filename = shift;
+
+	my $contigh = $dbh->prepare("select contig_number, bases from contigs");
+	$contigh->execute();
+	my $fastacontig = Bio::SeqIO->new(-file=>">$filename", -format=>'fasta');
+	while(my $row = $contigh->fetchrow_hashref)
+	{
+		my $bioseq = Bio::Seq->new( -display_id=>$row->{contig_number}, -seq=>$row->{bases});
+		$fastacontig->write_seq($bioseq);
+	}
+	return $filename;
+}
+#################################
+#
+# SUB: Find Sequences in fasta 
+#
+#################################
+sub find_sequence_in_fasta {
+
+	my $sequence = shift;
+	my $name = shift;
+	my @hit_array;
+	my $sequences = Bio::SeqIO->new('-file'         => "<$fasta_bases_file",
+        				'-format'       => "fasta");
+	# change sequence to only ATGC
+	$sequence =~ s/[^ATGC]//ig;
+	my $sequence_obj = Bio::Seq->new ( -display_id     => $name,
+                                           -seq            => $sequence);
+	my $sequence_to_check = lc($sequence_obj->seq);
+	my $sequence_to_check_rc = lc($sequence_obj->revcom()->seq);
+
+	while(my $seq = $sequences->next_seq)
+	{
+
+		my $last_index = 0;
+		my $this_index = -1;
+		my $num_hits = 0;
+		if($debug)
+		{
+			print "\t" . $seq->display_id . "\n";
+		}
+		my $checked_first = 0;
+		my $dir = "+";
+		# check both this sequence and its reverse complement;
+		while($checked_first < 2)
+		{
+			$last_index = 0;
+			$this_index = -1;
+			if($checked_first == 0)
+			{
+				$this_index = index(lc($seq->seq), $sequence_to_check);
+				$dir = "+";
+			} else
+			{
+				$this_index = index(lc($seq->seq), $sequence_to_check_rc);
+				$dir = "-";
+			}
+
+		        # while we have a hit
+			while($this_index > -1)
+			{
+				$num_hits++;
+
+				print   "ID \t"
+				. $name
+				. " matches \t" . $seq->display_id
+				. " location:\t" . $this_index . "\t"
+				.  (length($sequence_obj->seq) + $this_index) . "\t" . $dir . "\n";
+				push @hit_array, [$name, $seq->display_id, $this_index+1, (length($sequence_obj->seq) + $this_index), $dir];
+				$last_index = $this_index;
+				if($checked_first == 0)
+				{
+					$this_index = index(lc($seq->seq), $sequence_to_check, $last_index+1);
+				} else
+				{
+					$this_index = index(lc($seq->seq), $sequence_to_check_rc, $last_index+1);
+				}
+			}
+		} # END while checked first
+
+		$checked_first++;
+	} # End while this db row sequence has checked a particular contig
+
+	return \@hit_array;
+}
+
+
+sub process_options_file
+{
+	my $file_name = shift;
+	my $config_hash = shift;
+	
+	open(CONFIG, $file_name) or die ("Can not open Configuration file: $file_name\n");
+	
+	while(<CONFIG>)
+	{
+		my $line = $_;
+		chomp($line);
+		# First check if this is a comment line
+
+		if($line =~ m/^\s*#/)
+		{
+			next;
+		}
+
+		# Now check to make sure this is a correct configuration line (it must have an equal sign and something before and after the equal sign
+
+		if(!($line =~ /\w+\s*\=\s*[\w+\/]/))
+		{
+			next;
+		}
+
+		# Now process the line
+		my ($variable, $value) = split("=", $line);
+		# Check for a comment after the equals sign and if it's there get rid of anything after the comment
+		if($value =~ /\#/)
+		{
+			$value =~ s/\#.*$//;
+		}
+
+		# remove whitespace from beginning and end of variables
+		$variable =~ s/^\s+//;
+		$variable =~ s/\s+$//;
+		$value =~ s/^\s+//;
+		$value =~ s/\s+$//;
+
+		$config_hash->{$variable} = $value;
+		debug(join("\t", "Setting:", $variable, $value), 0);
+		
+	}
+	close(CONFIG);
+	return $config_hash;
+}
+
+#################################
+#
+# Disconnect from the database
+#
+#################################
+
+$dbh->disconnect;
+# end

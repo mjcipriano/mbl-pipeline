@@ -1,0 +1,124 @@
+#################################
+#
+# Turn off/on parts of this script to run different processes
+#
+#################################
+
+drop_schema			= 0 
+create_schema			= 0
+create_directories		= 0 
+
+#################################
+#
+# Reads/Contig Parsing [INPUT]
+#
+#################################
+parse_xml			= 0 # Trace file about the reads / chromatograph
+parse_unplaced			= 0 # not necessarily created, Arachne file, reads that were not placed in the assembly
+parse_links			= 0 # Contig to Supercontig
+parse_reads			= 0 # assembly.reads 
+parse_reads_bases		= 0 # base sequences, fasta file
+parse_reads_qual		= 0 # quality information, if you have it
+parse_assembly_bases		= 0 # Load the contigs into the database
+parse_assembly_qual		= 0 # Load the contigs quality into the database, if you have it
+
+###############################
+#
+# Output assembly files
+#
+###############################
+create_modified_fasta		= 0 # will create a supercontig fasta file to use against the supercontig view
+create_modified_reads_fasta	= 0 # will create a fasta file of used reads with the unused potions of the reads cut out
+
+##############################
+#
+# Base tables needed for the database
+#
+#############################
+load_data_from_old		= 0 # This will populate data tables from an old version of the database (sage library names, algorithms, databases, etc)
+
+#################################
+#
+# Sage Parsing
+#
+#################################
+create_sage_from_file		= 0 # to import sage data from a tab delimited file
+map_sage_to_db_mummer		= 0
+map_sage_to_db_polya		= 0
+calculate_sage_totals		= 0
+map_sage_to_orf_secondary	= 0 # this will dump data into a temp table to be used for next part
+map_sage_to_orf_tert		= 0 # this will insert into orftosage for determined tag->orf mappings
+create_sage_from_db		= 0 # this will create sage.gff files
+
+#################################
+#
+# Other analyses
+# 
+#################################
+find_repeat			= 0 # Repeating sequences, misassemblies near them
+find_trna			= 0 # looks for specific sequence for the folding pattern
+calculate_coverage		= 0 # Calculate the read overlap and create a gff file for a graph
+create_quality_gff		= 0 # Create a quality gff file
+calculate_matches_nucmer	= 0 # Calculate all matches within the genome and create both a matches gff file and a matches graph file, same sequence, links them, if really large this can be very slow or make larger minimum size 
+#previous_assembly_matches_nucmer=0 # Calculate matches with a previous assembly, need to edit the subroutine for placement of input file
+#calculate_uniqueness=0 # Determine how unique areas of the genome are with a sliding window analysis, not yet finished
+#compare_sequences_output_gff=0 # Don't use for now
+
+#################################
+#
+# Orf Parsing 
+# 
+#################################
+insert_blast_annotation		= 0 # This will insert annotations for orfs into the annotation table from blasts if there is no annotation
+move_orfs_from_old		= 0 # will move orfs over from an older version of the database and search in the new assembly
+#move_orfs_from_old_mummer=0 # not finished, doesn't work yet
+find_orfs_glimmer		= 0 # will use glimmer to search for new orfs in this assembly, requires the training set tables/organism.fasta
+delete_invalid_orfs		= 0 # this will check for duplications and invalid orfs and mark them as deleted
+delete_unlikely_orfs		= 0 # Don't use mostly, This will use blast, pfam and test scores to remove out of frame internal orfs
+#create_supercontig_orf_from_input=0 # will read in a tab delimited file and create a gff file, not used any more
+run_orf_tests			= 0 # will run tests on all orfs to give P/F or scores to determine if they are real orfs, Requires training set tables/organism.fasta
+
+
+#################################
+#
+# Output of gff files
+# 
+#################################
+create_read_gff			= 0 # Contigs, supercontigs and reads
+create_supercontig_orf_from_db	= 0 # Create supercontig orf gff (links orfs to supercontig)
+create_transcript_gff		= 0 # If this is selected along with create_supercontig_orf_from_db it will create an additional transcript gff file
+create_domains_from_db		= 0 # Common motifs within an ORF
+create_intergenic_blast_from_db	= 0 # This will create intergenic.gff files which are blast hits in between called orfs - after it has been blasted
+
+#################################
+#
+# Prepare search tables for blasting
+# 
+#################################
+load_slices_fasta		= 0 # This will populate the slices table with data from a supercontig.slices.fasta
+populate_intergenic_search	= 0 # This will populate the sequence_search table with all data in between orfs, use for blasting
+populate_slices_search		= 0 # This will populate the sequence_search table with data from the slices table
+populate_search_table		= 0 # This will populate the sequence_search table for high throughput blasting via the generic_search.pl script, use for blasting
+
+
+#################################
+#
+# Creation of other databases and downloadable files
+#
+################################
+create_search_db		= 1 # Will create blast and emboss format databases
+create_download_files		= 1 # fasta output, rerun after blasting
+#create_web_files=0 # Not used anymore
+
+###########  BLAST NOW!!!############
+#start_cluster_blast=0 # not yet working
+
+
+####################################
+#
+# Load the GFF database
+#
+###################################
+
+load_db				= 0 # this will load the database with this organisms gff files
+

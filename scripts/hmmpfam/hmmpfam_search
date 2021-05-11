@@ -1,0 +1,204 @@
+#!/usr/bin/perl -w
+
+#########################################
+#
+# hmmpfam_search: 
+#
+# Author: Susan Huse, shuse@mbl.edu
+#
+# Date: Fri Oct 20 13:34:42 EDT 2006
+#
+# Keywords : if you want seqinfoname to find this, remove the space before the colon 
+# 
+# Assumptions: 
+#
+# Revisions:
+#
+# Programming Notes:
+#
+########################################
+use strict;
+use Bio::Seq;
+use Bio::SeqIO;
+use Bio::Tools::Hmmpfam;
+use Conjbpcdb;
+use File::Temp qw / tempfile tempdir /;
+
+#/#####################################
+#
+# Set up usage statement
+#
+#######################################
+my $scriptHelp = "
+ hmmpfam_search - takes sequences from a gmod database sequence_search table
+          and runs them against hmmpfam
+\n";
+
+my $usage = " Usage:  hmmpfam_search Pfam_fs in.fasta
+\n";
+
+#            Options:  
+#                      -a does something
+#                      -d does something else
+
+#######################################
+#
+# Definition statements
+#
+#######################################
+#Commandline parsing
+#my $argNum = 3;
+my $minargNum = 2;
+my $maxargNum = 4;
+my $verbose = 0;
+
+#Runtime variables
+my $searchDB;
+my $dbName;
+my $tableName = "sequence_search";
+my $sequenceType;
+
+#######################################
+#
+# Test for commandline arguments
+#
+#######################################
+
+if (! $ARGV[0] ) 
+{
+	print $scriptHelp;
+	print $usage;
+	exit -1;
+} 
+
+while ((scalar @ARGV > 0) && ($ARGV[0] =~ /^-/))
+{
+	if ($ARGV[0] =~ /-h/) {
+		print $scriptHelp;
+		print $usage;
+		exit 0;
+#	} elsif ($ARGV[0] =~ /^-p/) {
+#		shift @ARGV;
+#		$exampleVar = $ARGV[0];
+#		print "$exampleVar\n";
+#		shift @ARGV;
+	} elsif ($ARGV[0] eq "-v") {
+		$verbose = 1;
+		shift @ARGV;
+	} elsif ($ARGV[0] =~ /^-/) { #unknown parameter, just get rid of it
+		shift @ARGV;
+	}
+}
+
+
+#######################################
+#
+# Parse commandline arguments, ARGV
+#
+#######################################
+
+#if (scalar @ARGV != $argNum) {
+if ((scalar @ARGV < $minargNum) || (scalar @ARGV > $maxargNum)) {
+	print "Incorrect number of arguments.\n";
+	print "$usage\n";
+	exit;
+} 
+
+#Test validity of commandline arguments
+$dbName = $ARGV[0];
+$sequenceType = $ARGV[1];
+$searchDB = $ARGV[2];
+
+#######################################
+#
+# Open the files
+#
+#######################################
+
+#Fasta file for running hmmpfam on
+(my $fasta_fh, my $tempFasta) = tempfile('fasta_XXXX', UNLINK => 1);
+my $out = Bio::SeqIO->new( '-file'=> ">$tempFasta", '-format'=> "fasta") || die ("Unable to write to $tempFasta.  Exiting...\n");
+#open (OUT, ">$tempFasta") || die ("Unable to write to output file: $tempFasta.  Exiting.\n");
+
+#hmmpfam file to send output to and to read back into the database
+(my $hmmpfam_fh, my $tempHMM) = tempfile('hmmpfam_XXXX', UNLINK => 0);
+
+#######################################
+#
+# Connect to the database
+#
+#######################################
+
+my $condb = Conjbpcdb::new(undef, $dbName);
+my $dbh = $condb->dbh();
+
+#######################################
+#
+# SQL statements
+#
+#######################################
+
+#Select
+my $selectSearch = "SELECT s.id, s.idname, d.name as dbname, t.type as type, s.sequence, translate, db_id, algorithm_id FROM sequence_search as s, algorithms as a, db as d, sequence_type as t WHERE s.algorithm_id = a.id AND s.db_id = d.id AND sequence_type_id = t.id AND a.name = 'hmmpfam' LIMIT 3";
+my $selectSearch_h = $dbh->prepare($selectSearch);
+$selectSearch_h->execute;
+
+my $insertPfam = "INSERT INTO blast_results (idname, score, hit_start, hit_end, hit_name, accession_number, description, algorithm, db, gaps, query_string, hit_string, homology_string, hsp_rank, evalue, sequence_type_id, query_start, query_end, hit_rank, id ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+my $insertPfam_h = $dbh->prepare($insertPfam);
+
+#######################################
+#
+# Write the sequence_search to fasta
+#
+#######################################
+
+while (my $row = $selectSearch_h->fetchrow_hashref) 
+{ 
+	my $id = $row->{idname}; 
+	my $seq = $row->{sequence};
+	my $translate = $row->{translate};
+	my $hmmdb = $row->{dbname};
+	my $type = $row->{type};
+
+	my $seqObj = Bio::Seq->new( -seq=>$seq, -id=>$id);
+	if ($translate =~/Y/i) { $seqObj = $seqObj->translate; }
+	$out->write_seq($seqObj);
+}
+
+#######################################
+#
+# Run hmmpfam
+#
+#######################################
+my $exe = "hmmpfam Pfam_fs $tempFasta > $tempHMM";
+#system($exe);
+
+#print "$tempHMM\n";
+#exit;
+#######################################
+#
+# Write the sequence_search to fasta
+#
+#######################################
+
+#my $hmmObj = new Bio::Tools::Hmmpfam(-fh=>$hmmpfam_fh);
+my $hmmObj = new Bio::Tools::Hmmpfam(-'file' => "hmmpfam_9zf4");
+while (my $feat = $hmmObj->next_result)
+{
+	my $queryF = $feat->feature1; 
+	my $hitF = $feat->feature2;
+
+#my $insertPfam = "INSERT INTO blast_results (idname, score, hit_start, hit_end, hit_name, accession_number, description, algorithm, db, gaps, query_string, hit_string, homology_string, hsp_rank, evalue, sequence_type_id, query_start, query_end, hit_rank, id ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+	$insertPfam_h->execute($feat->seq_id, $feat->hscore, $feat->hstart, $feat->hend, $feat->hseqname, "", $feat->description, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+}
+
+#model hmm model used, can look up map to accession number
+#description
+#score, evalue as per blast
+#N number of times model found
+#seq-f = start
+#seq-t = stop
+#hmm-f = start on hmm protein
+#hmm-t = stop on hmm proteinkkk
+
+#my $insertPfam = "INSERT INTO blast_results (idname, score, hit_start, hit_end, hit_name, accession_number, description, algorithm, db, gaps, query_string, hit_string, homology_string, hsp_rank, evalue, sequence_type_id, query_start, query_end, hit_rank, id ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";

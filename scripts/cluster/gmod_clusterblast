@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+
+use strict;
+use Getopt::Long;
+use File::Temp qw/ tempfile /;
+
+my $log_file = '/xraid/bioware/gmod/data/cblast.log';
+my $database = undef;
+my $dbfile = undef;
+my $num_nodes = 5;
+my $cluster = 3;
+
+
+my $vars = GetOptions(	"log_file=s"	=>\$log_file,
+			"database=s"	=>\$database,
+			"dbfile=s"	=>\$dbfile,
+			"nodes=i"	=>\$num_nodes,
+			"cluster=i"	=>\$cluster
+	);
+
+
+if(!defined($database) || !defined($dbfile) )
+{
+print '
+log_file	A file to log all output from the cluster nodes
+database	The name of the database that holds your search queue
+dbfile		The name of the configuration file
+nodes		The number of nodes/cpu
+cluster		Which cluster you would like to run this ok (default: 3)
+
+Example: ./gmod_clusterblast --log_file=/xraid/habitat/gblast.log --database=giardia14 --dbfile=/xraid/habitat/db.conf --nodes=15
+
+';
+exit;
+}
+my $script_string =
+'#!/bin/csh
+#$ -j y
+#$ -o ' . $log_file . '
+#$ -N cblast
+#$ -cwd
+  
+setenv BLASTDB /
+setenv MBLPIPE_DBFILE ' . $dbfile . '
+hostname;
+';
+if($cluster == 2)
+{
+	$script_string .= '
+source /xraid/bioware/linux/csh.login
+setenv PERL5LIB /usr/lib/perl5/site_perl/5.8.0/i386-linux-thread-multi/:$PERL5LIB
+';
+
+} else
+{
+#$script_string .= '
+#setenv PERL5LIB /usr/lib64/perl5/site_perl/5.8.5/x86_64-linux-thread-multi/:$PERL5LIB
+#';
+}
+$script_string .= '
+/xraid/bioware/gmod/mbl-pipeline/scripts/cluster/gmod_seqsearch ' . $database . '
+';
+if($num_nodes < 1)
+{
+	$num_nodes = 1;
+}
+
+
+if($num_nodes > 60)
+{
+	$num_nodes = 60;
+}
+
+# Create a temporary file to submit
+my ($script_fh, $script_filename) = tempfile (SUFFIX => '.sh');
+print $script_fh $script_string;
+
+for(1..$num_nodes)
+{
+	system("qsub $script_filename");
+	system("echo $script_filename");
+#	system("cat $script_filename");
+}
+

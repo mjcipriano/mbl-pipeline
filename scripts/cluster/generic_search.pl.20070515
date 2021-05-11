@@ -1,0 +1,234 @@
+#!/usr/bin/perl 
+
+use strict;
+use Bio::SimpleAlign;
+use Bio::Tools::Run::StandAloneBlast;
+use Bio::Tools::Run::Hmmer;
+use Bio::SearchIO::Writer::HTMLResultWriter;
+use Bio::Tools::BPlite::Sbjct;
+use Bio::AlignIO;
+use Bio::SeqIO;
+use Bio::Root::IO;
+use DBI;
+use Mbl;
+
+BEGIN {$ENV{BLASTDB} = '/'; }
+
+my $organism = $ARGV[0];
+
+my $mbl = Mbl::new(undef, $organism);
+my $dbh = $mbl->dbh;
+
+my $hits_to_store = 1000000000000;
+
+
+my $writerhtml = new Bio::SearchIO::Writer::HTMLResultWriter();
+
+
+my $query = " select s.id, s.idname, s.sequence_type_id, s.db_id, s.algorithm_id, s.sequence, s.translate, a.name as algorithm_name, db.name as database_name from sequence_search s, algorithms a, db
+WHERE db.id = s.db_id 
+AND a.id = s.algorithm_id
+LIMIT 1
+";
+
+my $sth = $dbh->prepare($query);
+
+my $current_query = "insert into current_search (idname, sequence_type_id, db_id, algorithm_id) VALUES (?, ?, ?, ?)";
+my $inshand = $dbh->prepare($current_query);
+
+my $delete_query = "delete from sequence_search where id = ?";
+my $delhand = $dbh->prepare($delete_query);
+
+my $del_result_query = "delete from blast_results 
+				where idname = ? 
+				AND sequence_type_id = ?
+                                AND db=? 
+                                AND algorithm = ?";
+
+my $delrshand = $dbh->prepare($del_result_query);
+
+my $del_report_query = "delete from blast_report_full 
+                                where idname = ?
+                                AND sequence_type_id = ?
+                                AND db_id=?
+                                AND algorithm_id = ?";
+
+my $delrphand = $dbh->prepare($del_report_query);
+
+
+my $insert_query = "insert into blast_results (
+			idname,
+                     	sequence_type_id,
+                        score,
+                        evalue,
+                        query_start,
+                        query_end,
+                        hit_name,
+			hit_start,
+			hit_end,
+			hit_rank,
+                        accession_number,
+                        description,
+                        algorithm,
+                        db,
+                        gaps,
+                        frac_identical,
+                        frac_conserved,
+                        query_string,
+                        hit_string,
+                        homology_string,
+			hsp_rank,
+			hsp_strand,
+			gi
+			)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+my $insert_handler = $dbh->prepare($insert_query);
+
+
+my $insert_full_string = "insert into blast_report_full
+                          (idname,
+                           sequence_type_id,
+                           db_id,
+                           algorithm_id,
+                           report)
+                           VALUES (?, ?, ?, ?, ?)";
+my $insert_full_handler = $dbh->prepare($insert_full_string);
+
+
+my $delhand_c_query = "delete from current_search where idname = ? AND sequence_type_id = ? AND db_id = ? AND algorithm_id = ?";
+my $delhand_c = $dbh->prepare($delhand_c_query);
+
+my $keep_going = 1;
+
+my $last_id = '';
+
+while($keep_going)
+{
+	if(check_continue($organism))
+	{
+		$keep_going = 0;
+	}
+	if($keep_going)
+	{
+		$sth->execute;
+	} 
+
+	if($keep_going)
+	{
+		if($sth->rows == 0)
+		{
+		    	$keep_going = 0;
+			print "Exiting - No More Sequences\n";
+		}
+	} 
+
+	if(!$keep_going)
+	{
+		# Nothing, it will exit now
+	} else {
+	    my $this_row = $sth->fetchrow_hashref;
+		$inshand->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id}); 
+
+		if($inshand->rows == 1)
+		{
+
+	        $delhand->execute($this_row->{id});
+
+	        # delete hits in the database that are the same as this one
+	        $delrshand->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id}); 
+	        $delrphand->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id});
+
+			my $blast_report;
+			my $factory;
+			my $input = Bio::Seq->new(-id=>$this_row->{idname} , '-seq' => $this_row->{sequence} );
+			if($this_row->{translate} eq 'Y')
+                        {
+                        	$input = $input->translate();
+                        }
+
+			if($this_row->{algorithm_name} eq 'hmmpfam')
+			{
+				# Process with hmmer
+				$factory = Bio::Tools::Run::Hmmer->new('program'=>'hmmpfam', 'db'=>'/blastdb/' . $this_row->{database_name});
+				$blast_report = $factory->run($input);
+
+			} elsif($this_row->{algorithm_name} eq 'iprscan') {
+				# Process with iprscan
+			} else {
+				my @params = (  'program' => $this_row->{algorithm_name},
+		                		'database' => '/blastdb/' . $this_row->{database_name},
+						'I'=> 'T'
+						);
+	
+				$factory = Bio::Tools::Run::StandAloneBlast->new(@params);
+		    	$blast_report = $factory->blastall($input);
+			}
+
+		 	my $this_result = $blast_report->next_result;
+
+			my $current_hit = 0;
+			while( (my $hit = $this_result->next_hit()) && ($current_hit < $hits_to_store) )
+			{
+				$current_hit++;
+				while(my $hsp = $hit->next_hsp)
+				{
+					my $gi_num = undef;
+					my $acc_num = $hit->accession;
+					if($hit->name =~ /gi|/)
+					{
+						($gi_num) = $hit->name =~ /gi\|(\d+)/;
+					}
+
+					if($hit->accession =~ /^gi|/)
+					{
+						$acc_num =~ s/gi\|//;
+					}
+
+		  			$insert_handler->execute(
+						$this_row->{idname},
+						$this_row->{sequence_type_id},
+						$hsp->score,
+						$hsp->evalue,
+						$hsp->query->start,
+						$hsp->query->end,
+						$hit->name,
+						$hsp->hit->start,
+						$hsp->hit->end,
+						$hit->rank,
+						$acc_num,
+						$hit->description,
+						$this_row->{algorithm_id},
+						$this_row->{db_id},
+						$hsp->gaps,
+						$hsp->frac_identical,
+						$hsp->frac_conserved,
+						$hsp->query_string,
+						$hsp->hit_string,
+						$hsp->homology_string,
+						$hsp->rank,
+						$hsp->strand,
+						$gi_num
+						);
+				} # END HSP
+			} # END CURRENT HIT WHILE
+	
+			$insert_full_handler->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id}, $writerhtml->to_string($this_result));
+		    $delhand_c->execute($this_row->{idname}, $this_row->{sequence_type_id}, $this_row->{db_id}, $this_row->{algorithm_id});
+		} # END ELSE WE ALREADY HAVE SOMEONE WORKING ON THIS ONE
+		sleep int(rand(11));
+	}  # END ELSE THERE IS SOMETHING LEFT TO DO
+}  # END WHILE KEEP GOING
+
+
+sub check_continue
+{
+	my $organism = shift;
+
+	if(-f "/xraid/habitat/shuse/cluster/cblast_all/$organism.stop")
+	{
+		print "Exiting due to user request (stop file existence)\n";
+		return 1;
+	}
+
+	return 0;
+}

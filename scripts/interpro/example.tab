@@ -1,0 +1,10 @@
+480	852512781B555F34	121	HMMTigr	TIGR00004	TIGR00004: endoribonuclease L-PSP, putative	2	120	2.1e-57	T	21-Mar-2005	IPR006056	YjgF-like protein	
+480	852512781B555F34	121	HMMPfam	PF01042.8	Endoribonuclease L-PSP	7	120	4.4e-56	T	21-Mar-2005	IPR006175	Endoribonuclease L-PSP	
+678	47C65A0958A16E4A	217	HMMPfam	PF06941.2	5' nucleotidase, deoxy (Pyrimidine), cytosol	1	191	4.9e-10	T	21-Mar-2005	IPR010708	5 nucleotidase, deoxy, cytosolic type C	
+694	10D87800153B3BF5	45	Seg	seg	seg	15	28	NA	?	21-Mar-2005	NULL	NULL
+940	2E5E6511215BEA2F	205	FPrintScan	PR00449	RASTRNSFRMNG	8	29	9.9e-20	T	21-Mar-2005	IPR001806	Ras GTPase	Molecular Function:GTP binding (GO:0005525), Biological Process:small GTPase mediated signal transduction (GO:0007264)
+940	2E5E6511215BEA2F	205	FPrintScan	PR00449	RASTRNSFRMNG	31	47	9.9e-20	T	21-Mar-2005	IPR001806	Ras GTPase	Molecular Function:GTP binding (GO:0005525), Biological Process:small GTPase mediated signal transduction (GO:0007264)
+940	2E5E6511215BEA2F	205	FPrintScan	PR00449	RASTRNSFRMNG	51	73	9.9e-20	T	21-Mar-2005	IPR001806	Ras GTPase	Molecular Function:GTP binding (GO:0005525), Biological Process:small GTPase mediated signal transduction (GO:0007264)
+940	2E5E6511215BEA2F	205	FPrintScan	PR00449	RASTRNSFRMNG	148	170	9.9e-20	T	21-Mar-2005	IPR001806	Ras GTPase	Molecular Function:GTP binding (GO:0005525), Biological Process:small GTPase mediated signal transduction (GO:0007264)
+940	2E5E6511215BEA2F	205	HMMTigr	TIGR00231	small_GTP: small GTP-binding protein domain	5	168	4.8e-20	T	21-Mar-2005	IPR005225	Small GTP-binding protein domain	Molecular Function:GTP binding (GO:0005525)
+940	2E5E6511215BEA2F	205	HMMSmart	SM00173	no description	5	173	2.8e-14	T	21-Mar-2005	IPR003577	Ras small GTPase, Ras type	Molecular Function:GTP binding (GO:0005525), Biological Process:small GTPase mediated signal transduction (GO:0007264)
