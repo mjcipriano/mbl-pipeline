@@ -64,7 +64,7 @@ sub new
 		$self->{HOSTNAME} = "jbpcdb";
 		$self->{PORT} = "3306";
 		$self->{USER} = "gid";
-		$self->{PASSWORD} = "gidgid123";
+		$self->{PASSWORD} = "NOPE";
 	}
 
 	$self->{DATABASE} = $database;
